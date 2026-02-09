@@ -1,0 +1,116 @@
+@startuml Drand Failure Scenarios
+
+title TAO Colosseum - Drand Failure Scenarios
+footer Edge cases and failure handling
+
+skinparam backgroundColor #FEFEFE
+skinparam noteBackgroundColor #FFFFCC
+
+actor "Resolver" as User
+participant "TAO_Colosseum" as Colosseum
+participant "Storage\nPrecompile" as Storage
+database "Drand Pallet" as Drand
+
+== Scenario 1: Happy Path (Typical ~1-2 blocks wait) ==
+
+note over Drand: LastStoredRound = 12345\nPulse 12345 available
+
+User -> Colosseum: resolveGame() [Phase 1]
+Colosseum -> Storage: read LastStoredRound
+Storage --> Colosseum: 12345
+Colosseum -> Colosseum: targetRound = 12348\ncommitBlock = 1000
+Colosseum --> User: DrandRoundCommitted(12348)
+
+note over User: ~12-24 seconds later\n(1-2 blocks)
+
+note over Drand: Offchain worker has\nfetched rounds 12346-12350
+
+User -> Colosseum: resolveGame() [Phase 2]
+Colosseum -> Storage: read Pulses[12348]
+Storage --> Colosseum: Pulse data (41+ bytes)
+Colosseum -> Colosseum: Extract randomness\nDetermine actualEndBlock\nResolve game
+Colosseum --> User: GameResolved(winner)
+
+note over Colosseum #90EE90: SUCCESS\nGame resolved in ~2 blocks
+
+== Scenario 2: Brief Delay (Offchain worker behind) ==
+
+note over Drand: LastStoredRound = 12345\nDrand API has rounds up to 12355\nOffchain worker is catching up
+
+User -> Colosseum: resolveGame() [Phase 1]
+Colosseum -> Storage: read LastStoredRound
+Storage --> Colosseum: 12345
+Colosseum -> Colosseum: targetRound = 12348
+Colosseum --> User: DrandRoundCommitted(12348)
+
+User -> Colosseum: resolveGame() [Phase 2]
+Colosseum -> Storage: read Pulses[12348]
+Storage --> Colosseum: empty [] (not yet available)
+Colosseum --> User: revert WaitingForRandomness()
+
+note over User: Wait ~12 seconds (1 block)
+
+note over Drand: Offchain worker catches up\nPulses 12346-12350 now stored
+
+User -> Colosseum: resolveGame() [Phase 2] retry
+Colosseum -> Storage: read Pulses[12348]
+Storage --> Colosseum: Pulse data
+Colosseum --> User: GameResolved(winner)
+
+note over Colosseum #90EE90: SUCCESS\nGame resolved after retry
+
+== Scenario 3: Extended Outage (Hours) ==
+
+note over Drand #FFCCCC: Offchain worker stuck\nor Drand API down\nNo new pulses for hours
+
+User -> Colosseum: resolveGame() [Phase 1]
+Colosseum -> Storage: read LastStoredRound
+Storage --> Colosseum: 12345
+Colosseum -> Colosseum: targetRound = 12348\ncommitBlock = 1000
+Colosseum --> User: DrandRoundCommitted(12348)
+
+loop Multiple retry attempts over hours
+    User -> Colosseum: resolveGame() [Phase 2]
+    Colosseum -> Storage: read Pulses[12348]
+    Storage --> Colosseum: empty []
+    Colosseum --> User: revert WaitingForRandomness()
+    note over User: Wait and retry...
+end
+
+note over User: Eventually: block.number > 1000 + 7200
+
+User -> Colosseum: resolveGame() [Phase 2]
+Colosseum -> Colosseum: block.number (8201) > commitBlock (1000) + 7200
+Colosseum -> Colosseum: TIMEOUT TRIGGERED
+Colosseum -> Colosseum: _cancelGame()\nReturn all fees to gameBalance
+Colosseum --> User: DrandTimeoutCancelled()\nGameCancelled("Drand pulse timeout")
+
+note over Colosseum #FFCCCC: CANCELLED\nAll bets refundable\nNo fees taken
+
+== Scenario 4: Drand Completely Unavailable at Start ==
+
+note over Drand #FFCCCC: LastStoredRound = 0\n(Drand never initialized or wiped)
+
+User -> Colosseum: resolveGame() [Phase 1]
+Colosseum -> Storage: read LastStoredRound
+Storage --> Colosseum: 0
+Colosseum -> Colosseum: lastRound == 0\nDrand not available
+Colosseum -> Colosseum: _cancelGame("Drand not available")
+Colosseum --> User: GameCancelled("Drand not available")
+
+note over Colosseum #FFCCCC: CANCELLED IMMEDIATELY\nAll bets refundable
+
+== Scenario 5: Randomness is bytes32(0) - FIXED ==
+
+note over Drand: Pulse 12348 exists\nBut randomness = 0x000...000\n(probability: 2^-256)
+
+User -> Colosseum: resolveGame() [Phase 2]
+Colosseum -> Storage: read Pulses[12348]
+Storage --> Colosseum: Pulse(round=12348, randomness=0x00..00, sig=...)
+Colosseum -> Colosseum: Decode pulse\n(exists=true, randomness=0x00..00)
+Colosseum -> Colosseum: exists == true\nUse randomness (even if 0)
+Colosseum --> User: RandomnessUsed(gameId, 12348, 0x00..00)\nGameResolved(winner)
+
+note over Colosseum #90EE90: FIXED!\nNow uses (bool exists, bytes32 randomness)\nPulse existence checked separately\nfrom randomness value
+
+@enduml

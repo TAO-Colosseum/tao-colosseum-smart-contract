@@ -1,0 +1,86 @@
+@startuml Timing Relationships
+
+title TAO Colosseum - Timing Relationships
+
+skinparam backgroundColor #FEFEFE
+
+concise "Drand\nRounds" as Drand
+concise "Chain\nBlocks" as Chain
+concise "Game\nPhase" as Game
+
+@0
+Drand is "R"
+Chain is "0"
+Game is "Betting" #LightGreen
+
+@1
+Drand is "R+4"
+Chain is "1"
+
+@2
+Drand is "R+8"
+Chain is "2"
+
+@3
+Drand is "R+12"
+Chain is "3"
+
+@4
+Drand is "..."
+Chain is "..."
+
+@5
+Drand is "R+300"
+Chain is "75"
+Game is "Final Call" #Orange
+
+@6
+Drand is "R+332"
+Chain is "83"
+
+@7
+Drand is "R+400"
+Chain is "100"
+Game is "Ended" #Red
+
+@8
+Drand is "R+404"
+Chain is "101"
+Game is "Calculating" #Yellow
+
+@9
+Drand is "R+408"
+Chain is "102"
+
+@10
+Drand is "R+412"
+Chain is "103"
+Game is "Resolved" #LightBlue
+
+@11
+Drand is "..."
+Chain is "..."
+Game is "Claims"
+
+note bottom of Drand
+  Drand: 1 round = 3 sec
+  Chain: 1 block = 12 sec
+  ~4 drand rounds per block
+end note
+
+note bottom of Chain
+  Block 0: Game starts
+  Block 75: Final call begins
+  Block 100: Betting ends
+  Block 101: Phase 1 (commit)
+  Block 102-103: Phase 2 (finalize)
+end note
+
+note bottom of Game
+  Betting: 100 blocks (~20 min)
+  Final Call: last 25 blocks
+  Resolution: typically 1-2 blocks
+  Timeout: 7200 blocks (~24h)
+end note
+
+@enduml
