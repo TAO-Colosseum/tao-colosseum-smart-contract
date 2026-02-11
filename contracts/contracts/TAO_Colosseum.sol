@@ -105,6 +105,8 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     error GameNotCompromised();
     error EmergencyTimeoutNotReached();
     error NothingToWithdraw();
+    error InsufficientFeesForRefund();
+    error InsufficientGameBalance();
 
     // ==================== IMMUTABLE CONSTANTS ====================
     // SECURITY NOTE: All values below are compile-time constants (using 'constant' keyword).
@@ -513,15 +515,16 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         uint256 payout = 0;
         
         // Handle cancelled games - full refund (all bets)
+        // _cancelGame() has already moved all gameFees into gameBalance, so gameBalance holds full bet amounts
         if (!game.hasWinner && game.phase == GamePhase.Finalized) {
             payout = bet.amount;
+            if (gameBalance[_gameId] < payout) revert InsufficientGameBalance();
             bet.claimed = true;
-            
             gameBalance[_gameId] -= payout;
-            
+
             (bool success, ) = payable(msg.sender).call{value: payout}("");
             if (!success) revert TransferFailed();
-            
+
             emit RefundClaimed(_gameId, msg.sender, _side, payout);
             return;
         }
@@ -531,15 +534,16 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         }
         
         // Handle LATE BETS - full refund (anti-sniping protection)
+        // _calculateValidPools() already moved late bet fees from gameFees into gameBalance
         if (bet.isLateBet) {
-            payout = bet.amount;  // Full refund including fee portion
+            payout = bet.amount;
+            if (gameBalance[_gameId] < payout) revert InsufficientGameBalance();
             bet.claimed = true;
-            
             gameBalance[_gameId] -= payout;
-            
+
             (bool success, ) = payable(msg.sender).call{value: payout}("");
             if (!success) revert TransferFailed();
-            
+
             emit LateBetRefunded(_gameId, msg.sender, _side, payout);
             return;
         }
@@ -699,13 +703,16 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             blueBet.claimed = true;
         }
         
-        // Update balances
+        // Update balances - require full fee refund to be available (no silent partial loss)
+        if (userFees > 0 && gameFees[_gameId] < userFees) {
+            revert InsufficientFeesForRefund();
+        }
         gameBalance[_gameId] -= totalRefund;
-        if (userFees > 0 && gameFees[_gameId] >= userFees) {
+        if (userFees > 0) {
             gameFees[_gameId] -= userFees;
             totalRefund += userFees;
         }
-        
+
         // Transfer funds
         (bool success, ) = payable(msg.sender).call{value: totalRefund}("");
         if (!success) revert TransferFailed();
