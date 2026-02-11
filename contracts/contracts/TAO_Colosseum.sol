@@ -142,6 +142,9 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     uint256 public constant DRAND_FREQUENCY_SECONDS = 3;     // Drand quicknet emits every 3 seconds
     uint256 public constant BLOCK_TIME_SECONDS = 12;         // Bittensor EVM ~12s per block
     uint256 public constant EMERGENCY_TIMEOUT = 7 days;      // Emergency withdraw timeout
+    // Grace period before "chain lagging" can void: only allow void when this many seconds
+    // past predicted drand time (avoids griefing normal committed games; ~9s gap at commit)
+    uint256 public constant CHAIN_LAG_GRACE_SECONDS = 10 minutes;
 
     // ==================== STATE VARIABLES ====================
     
@@ -625,9 +628,9 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             }
         }
         
-        // Check B (Time Timeout): If real-world time has passed the predicted drand time,
-        // the chain is lagging and the randomness may be known externally
-        if (!isCompromised && block.timestamp > game.predictedDrandTimestamp) {
+        // Check B (Time Timeout): Only if chain is meaningfully lagging (past predicted time + grace).
+        // Grace period prevents voiding normal committed games (~9s gap at commit).
+        if (!isCompromised && block.timestamp > game.predictedDrandTimestamp + CHAIN_LAG_GRACE_SECONDS) {
             isCompromised = true;
             reason = "Chain lagging behind real-time - randomness potentially compromised";
         }
@@ -1198,14 +1201,14 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     
     /**
      * @notice Check if a game is compromised (chain lagging behind real-time)
-     * @dev Uses time-based check: block.timestamp > predictedDrandTimestamp
+     * @dev Uses time-based check: block.timestamp > predictedDrandTimestamp + CHAIN_LAG_GRACE_SECONDS
      */
     function isGameCompromised(uint256 _gameId) external view returns (bool) {
         Game storage game = games[_gameId];
         if (game.phase != GamePhase.Betting && game.phase != GamePhase.Calculating) return false;
         
-        // Check if chain is lagging (real-world time has passed the predicted drand time)
-        if (block.timestamp > game.predictedDrandTimestamp) return true;
+        // Check if chain is meaningfully lagging (past predicted time + grace period)
+        if (block.timestamp > game.predictedDrandTimestamp + CHAIN_LAG_GRACE_SECONDS) return true;
         
         // Check if randomness is already leaked (drand pulse available before game ends)
         if (game.phase == GamePhase.Betting && block.number < game.endBlock) {

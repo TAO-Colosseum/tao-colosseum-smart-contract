@@ -75,14 +75,16 @@ async function main() {
     console.log("   Max cost:", hre.ethers.formatEther(maxCost), "TAO\n");
   }
   
-  // Ask for approval
-  const answer = await askQuestion("Do you want to proceed with deployment? (yes/no): ");
-  
-  if (answer !== "yes" && answer !== "y") {
-    console.log("\n❌ Deployment cancelled by user.\n");
-    process.exit(0);
+  // Ask for approval (skip if --yes or -y passed)
+  const autoYes = process.argv.includes("--yes") || process.argv.includes("-y") || process.env.DEPLOY_AUTO_YES === "1";
+  if (!autoYes) {
+    const answer = await askQuestion("Do you want to proceed with deployment? (yes/no): ");
+    if (answer !== "yes" && answer !== "y") {
+      console.log("\n❌ Deployment cancelled by user.\n");
+      process.exit(0);
+    }
   }
-  
+
   console.log("\n🚀 Deploying TAOColosseum...\n");
   
   // Deploy with optimized gas settings
@@ -128,6 +130,9 @@ async function main() {
   
   console.log("📋 Add this to your .env.local:");
   console.log(`NEXT_PUBLIC_CONTRACT_ADDRESS=${address}\n`);
+
+  // Single line for scripts (e.g. verify)
+  console.log("DEPLOYED_ADDRESS=" + address);
 }
 
 main()

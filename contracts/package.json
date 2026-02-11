@@ -5,11 +5,15 @@
   "main": "index.js",
   "scripts": {
     "compile": "hardhat compile",
+    "clean": "hardhat clean",
+    "recompile": "hardhat clean && hardhat compile",
     "test": "hardhat test",
     "deploy": "hardhat run scripts/deploy.js",
     "deploy:localhost": "hardhat run scripts/deploy.js --network localhost",
     "deploy:testnet": "hardhat run scripts/deploy-bittensor.js --network bittensorTestnet",
-    "deploy:mainnet": "hardhat run scripts/deploy-bittensor.js --network bittensorMainnet",
+    "deploy:mainnet": "DEPLOY_AUTO_YES=1 hardhat run scripts/deploy.js --network bittensor",
+    "deploy:mainnet:interactive": "hardhat run scripts/deploy.js --network bittensor",
+    "verify": "hardhat verify --network taostats",
     "node": "hardhat node"
   },
   "devDependencies": {
