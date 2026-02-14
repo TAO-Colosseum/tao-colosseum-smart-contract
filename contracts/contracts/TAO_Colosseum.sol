@@ -724,146 +724,116 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     }
     
     // ==================== DRAND HELPER FUNCTIONS ====================
-    
+    // Bittensor EVM uses address 0x09 for Bn128Add (not EIP-152 blake2f), so we compute
+    // blake2b-128 in pure Solidity for Substrate Blake2_128Concat storage keys.
+
     /**
-     * @notice Blake2f precompile address (EIP-152)
-     */
-    address private constant BLAKE2F_PRECOMPILE = address(0x09);
-    
-    /**
-     * @notice Compute blake2b-128 hash using the blake2f precompile (EIP-152)
-     * @dev Uses assembly to avoid stack depth issues
-     * @param data Input data (up to 128 bytes)
+     * @notice BLAKE2b-128 (16-byte output) for 8-byte input. Pure Solidity; no precompile.
+     * @dev Matches Substrate Blake2_128Concat hasher for u64 key. Used to build drand.pulses(round) storage key.
+     * @param data Exactly 8 bytes (u64 little-endian)
      * @return hash 16-byte blake2b-128 hash
      */
-    function _blake2b128(bytes memory data) internal view returns (bytes16) {
-        // Blake2f input: rounds (4) + h (64) + m (128) + t (8) + f (1) = 213 bytes
-        bytes memory input = new bytes(213);
-        uint256 dataLen = data.length;
-        
-        assembly ("memory-safe") {
-            let inp := add(input, 32)
-            
-            // Rounds = 12 (0x0000000c big-endian)
-            mstore8(inp, 0)
-            mstore8(add(inp, 1), 0)
-            mstore8(add(inp, 2), 0)
-            mstore8(add(inp, 3), 0x0c)
-            
-            // h state (64 bytes) - blake2b-128 IV with parameter block XOR
-            // h[0] = IV[0] XOR 0x01010010 (16 byte output)
-            // IV[0] = 0x6a09e667f3bcc908, XOR 0x01010010 = 0x6a09e667f3bcf918
-            // All IVs stored in little-endian format
-            
-            // h[0] = 0x6a09e667f3bcc908 XOR 0x01010010 = 0x6a09e667f3bcf918 (LE)
-            mstore8(add(inp, 4), 0x18)
-            mstore8(add(inp, 5), 0xf9)
-            mstore8(add(inp, 6), 0xbc)
-            mstore8(add(inp, 7), 0xf3)
-            mstore8(add(inp, 8), 0x67)
-            mstore8(add(inp, 9), 0xe6)
-            mstore8(add(inp, 10), 0x09)
-            mstore8(add(inp, 11), 0x6a)
-            
-            // h[1] = 0xbb67ae8584caa73b (LE)
-            mstore8(add(inp, 12), 0x3b)
-            mstore8(add(inp, 13), 0xa7)
-            mstore8(add(inp, 14), 0xca)
-            mstore8(add(inp, 15), 0x84)
-            mstore8(add(inp, 16), 0x85)
-            mstore8(add(inp, 17), 0xae)
-            mstore8(add(inp, 18), 0x67)
-            mstore8(add(inp, 19), 0xbb)
-            
-            // h[2] = 0x3c6ef372fe94f82b (LE)
-            mstore8(add(inp, 20), 0x2b)
-            mstore8(add(inp, 21), 0xf8)
-            mstore8(add(inp, 22), 0x94)
-            mstore8(add(inp, 23), 0xfe)
-            mstore8(add(inp, 24), 0x72)
-            mstore8(add(inp, 25), 0xf3)
-            mstore8(add(inp, 26), 0x6e)
-            mstore8(add(inp, 27), 0x3c)
-            
-            // h[3] = 0xa54ff53a5f1d36f1 (LE)
-            mstore8(add(inp, 28), 0xf1)
-            mstore8(add(inp, 29), 0x36)
-            mstore8(add(inp, 30), 0x1d)
-            mstore8(add(inp, 31), 0x5f)
-            mstore8(add(inp, 32), 0x3a)
-            mstore8(add(inp, 33), 0xf5)
-            mstore8(add(inp, 34), 0x4f)
-            mstore8(add(inp, 35), 0xa5)
-            
-            // h[4] = 0x510e527fade682d1 (LE)
-            mstore8(add(inp, 36), 0xd1)
-            mstore8(add(inp, 37), 0x82)
-            mstore8(add(inp, 38), 0xe6)
-            mstore8(add(inp, 39), 0xad)
-            mstore8(add(inp, 40), 0x7f)
-            mstore8(add(inp, 41), 0x52)
-            mstore8(add(inp, 42), 0x0e)
-            mstore8(add(inp, 43), 0x51)
-            
-            // h[5] = 0x9b05688c2b3e6c1f (LE)
-            mstore8(add(inp, 44), 0x1f)
-            mstore8(add(inp, 45), 0x6c)
-            mstore8(add(inp, 46), 0x3e)
-            mstore8(add(inp, 47), 0x2b)
-            mstore8(add(inp, 48), 0x8c)
-            mstore8(add(inp, 49), 0x68)
-            mstore8(add(inp, 50), 0x05)
-            mstore8(add(inp, 51), 0x9b)
-            
-            // h[6] = 0x1f83d9abfb41bd6b (LE)
-            mstore8(add(inp, 52), 0x6b)
-            mstore8(add(inp, 53), 0xbd)
-            mstore8(add(inp, 54), 0x41)
-            mstore8(add(inp, 55), 0xfb)
-            mstore8(add(inp, 56), 0xab)
-            mstore8(add(inp, 57), 0xd9)
-            mstore8(add(inp, 58), 0x83)
-            mstore8(add(inp, 59), 0x1f)
-            
-            // h[7] = 0x5be0cd19137e2179 (LE)
-            mstore8(add(inp, 60), 0x79)
-            mstore8(add(inp, 61), 0x21)
-            mstore8(add(inp, 62), 0x7e)
-            mstore8(add(inp, 63), 0x13)
-            mstore8(add(inp, 64), 0x19)
-            mstore8(add(inp, 65), 0xcd)
-            mstore8(add(inp, 66), 0xe0)
-            mstore8(add(inp, 67), 0x5b)
-            
-            // m message (128 bytes at offset 68) - copy input data, rest is zero-padded
-            let dataPtr := add(data, 32)
-            let mPtr := add(inp, 68)
-            for { let i := 0 } lt(i, dataLen) { i := add(i, 1) } {
-                if lt(i, 128) {
-                    mstore8(add(mPtr, i), byte(0, mload(add(dataPtr, i))))
-                }
-            }
-            // Bytes 68+dataLen to 195 are already zero
-            
-            // t offset (16 bytes at offset 196) - t[0] = dataLen (LE), t[1] = 0
-            mstore8(add(inp, 196), and(dataLen, 0xff))
-            mstore8(add(inp, 197), and(shr(8, dataLen), 0xff))
-            // Rest of t is already zero
-            
-            // f = 1 (final block) at offset 212
-            mstore8(add(inp, 212), 1)
+    function _blake2b128(bytes memory data) internal pure returns (bytes16 hash) {
+        require(data.length == 8, "blake2b128: need 8 bytes");
+        // BLAKE2b IV (first 8 words, little-endian)
+        uint64[8] memory h = [
+            uint64(0x6a09e667f3bcc908) ^ 0x01010010, // digest_len=16, key_len=0
+            uint64(0xbb67ae8584caa73b),
+            uint64(0x3c6ef372fe94f82b),
+            uint64(0xa54ff53a5f1d36f1),
+            uint64(0x510e527fade682d1),
+            uint64(0x9b05688c2b3e6c1f),
+            uint64(0x1f83d9abfb41bd6b),
+            uint64(0x5be0cd19137e2179)
+        ];
+        uint64[16] memory m;
+        m[0] = uint64(uint8(data[0])) | (uint64(uint8(data[1])) << 8) | (uint64(uint8(data[2])) << 16) | (uint64(uint8(data[3])) << 24)
+            | (uint64(uint8(data[4])) << 32) | (uint64(uint8(data[5])) << 40) | (uint64(uint8(data[6])) << 48) | (uint64(uint8(data[7])) << 56);
+        // m[1..15] = 0
+        uint64 t0 = 8;
+        uint64 t1 = 0;
+        uint64 f = 0xffffffffffffffff; // final block
+        (h, ) = _blake2bCompress(h, m, t0, t1, f);
+        // Build 16-byte output: h[0] LE (8 bytes) || h[1] LE (8 bytes)
+        bytes memory out16 = new bytes(16);
+        for (uint256 i = 0; i < 8; i++) {
+            out16[i] = bytes1(uint8((h[0] >> (i * 8)) & 0xff));
+            out16[8 + i] = bytes1(uint8((h[1] >> (i * 8)) & 0xff));
         }
-        
-        // Call blake2f precompile
-        (bool success, bytes memory result) = BLAKE2F_PRECOMPILE.staticcall(input);
-        require(success && result.length == 64, "blake2f failed");
-        
-        // Extract first 16 bytes as blake2b-128 output
-        bytes16 hash;
         assembly ("memory-safe") {
-            hash := mload(add(result, 32))
+            hash := mload(add(out16, 32))
         }
         return hash;
+    }
+
+    function _blake2bCompress(
+        uint64[8] memory h,
+        uint64[16] memory m,
+        uint64 t0,
+        uint64 t1,
+        uint64 f
+    ) internal pure returns (uint64[8] memory out, uint64[16] memory) {
+        uint64[16] memory v;
+        for (uint256 i = 0; i < 8; i++) v[i] = h[i];
+        v[8] = 0x6a09e667f3bcc908;
+        v[9] = 0xbb67ae8584caa73b;
+        v[10] = 0x3c6ef372fe94f82b;
+        v[11] = 0xa54ff53a5f1d36f1;
+        v[12] = 0x510e527fade682d1 ^ t0;
+        v[13] = 0x9b05688c2b3e6c1f ^ t1;
+        v[14] = 0x1f83d9abfb41bd6b ^ f;
+        v[15] = 0x5be0cd19137e2179;
+        for (uint256 r = 0; r < 12; r++) {
+            uint256[16] memory s = _blake2bSigma(r);
+            _g(v, m, s[0], s[1], 0, 4, 8, 12);
+            _g(v, m, s[2], s[3], 1, 5, 9, 13);
+            _g(v, m, s[4], s[5], 2, 6, 10, 14);
+            _g(v, m, s[6], s[7], 3, 7, 11, 15);
+            _g(v, m, s[8], s[9], 0, 5, 10, 15);
+            _g(v, m, s[10], s[11], 1, 6, 11, 12);
+            _g(v, m, s[12], s[13], 2, 7, 8, 13);
+            _g(v, m, s[14], s[15], 3, 4, 9, 14);
+        }
+        unchecked {
+            for (uint256 i = 0; i < 8; i++) out[i] = h[i] ^ v[i] ^ v[i + 8];
+        }
+        return (out, m);
+    }
+
+    function _g(uint64[16] memory v, uint64[16] memory m, uint256 a, uint256 b, uint256 i, uint256 j, uint256 k, uint256 l) private pure {
+        unchecked {
+            v[i] = v[i] + v[j] + m[a];
+            v[l] = _rotr64(v[l] ^ v[i], 32);
+            v[k] = v[k] + v[l];
+            v[j] = _rotr64(v[j] ^ v[k], 24);
+            v[i] = v[i] + v[j] + m[b];
+            v[l] = _rotr64(v[l] ^ v[i], 16);
+            v[k] = v[k] + v[l];
+            v[j] = _rotr64(v[j] ^ v[k], 63);
+        }
+    }
+
+    function _rotr64(uint64 x, uint256 n) private pure returns (uint64) {
+        uint64 n64 = uint64(n);
+        return (x >> n64) | (x << (64 - n64));
+    }
+
+    function _blake2bSigma(uint256 r) private pure returns (uint256[16] memory s) {
+        uint8[16][12] memory sigma = [
+            [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+            [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+            [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+            [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+            [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+            [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+            [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+            [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+            [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+            [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4]
+        ];
+        for (uint256 i = 0; i < 16; i++) s[i] = sigma[r][i];
     }
     
     /**
@@ -871,7 +841,7 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
      * @param round The drand round number
      * @return key The full storage key
      */
-    function _buildDrandPulseKey(uint64 round) internal view returns (bytes memory) {
+    function _buildDrandPulseKey(uint64 round) internal pure returns (bytes memory) {
         // Encode round as u64 little-endian
         bytes memory roundLE = new bytes(8);
         uint64 r = round;
