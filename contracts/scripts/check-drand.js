@@ -29,9 +29,21 @@ async function main() {
     return;
   }
 
-  // 2) Try to read a specific round (builds pulse key via blake2f precompile)
-  const typicalTarget = lastRound + 403n;
+  // 2) Read lastRound (must be available - it's the last stored)
   console.log("\n--- Round availability ---");
+  try {
+    const lastAvailable = await colosseum.isDrandRoundAvailable(lastRound);
+    console.log("Is lastRound (" + lastRound + ") on chain?", lastAvailable);
+    if (!lastAvailable) {
+      console.log(">>> BUG: lastRound should always be readable! Key/hash may not match Substrate.");
+    }
+  } catch (e) {
+    const msg = e.message || e.shortMessage || String(e);
+    console.log("isDrandRoundAvailable(lastRound) failed:", msg);
+  }
+
+  // 3) Future round (lastRound + 403) - typically not stored yet
+  const typicalTarget = lastRound + 403n;
   console.log("Typical game target (lastRound + 403):", typicalTarget.toString());
   try {
     const available = await colosseum.isDrandRoundAvailable(typicalTarget);
@@ -48,7 +60,7 @@ async function main() {
     }
   }
 
-  // 3) Optional: for a specific game, is its target round available?
+  // 4) Optional: for a specific game, is its target round available?
   if (gameId != null && !isNaN(gameId)) {
     console.log("\n--- Game " + gameId + " ---");
     let phase, targetDrandRound, actualEndBlock, canFinalize;
