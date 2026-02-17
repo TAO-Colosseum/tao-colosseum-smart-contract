@@ -1232,22 +1232,6 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         return _getDrandRandomness(round);
     }
 
-    /// @dev Exposed for testing: full storage key for drand.pulses(round). Compare with Polkadot app encoded storage key.
-    function getDrandPulseKey(uint64 round) external pure returns (bytes memory) {
-        return _buildDrandPulseKey(round);
-    }
-
-    /// @dev Exposed for testing: BLAKE2b-128 of round encoded as u64 LE. Expected for 26145524: 0x8e70ca71b63dde37a5a4f3d695002aab
-    function getBlake2b128ForRound(uint64 round) external pure returns (bytes16) {
-        bytes memory roundLE = new bytes(8);
-        uint64 r = round;
-        for (uint256 i = 0; i < 8; i++) {
-            roundLE[i] = bytes1(uint8(r));
-            r = r >> 8;
-        }
-        return _blake2b128(roundLE);
-    }
-    
     /**
      * @notice Check drand health - returns info about drand availability
      * @return lastRound The last stored drand round
