@@ -24,6 +24,12 @@ module.exports = {
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
       // gasPrice: 'auto'
     },
+    bittensorArchive: {
+      url: process.env.BITTENSOR_ARCHIVE_RPC_URL || "https://archive.chain.opentensor.ai",
+      chainId: 964,
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+      // gasPrice: 'auto'
+    },
     // Bittensor Testnet
     bittensorTestnet: {
       url: process.env.BITTENSOR_TESTNET_RPC_URL || "	https://test.chain.opentensor.ai",
