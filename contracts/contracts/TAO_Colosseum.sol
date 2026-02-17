@@ -127,11 +127,15 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     uint256 public constant MAX_LEADERBOARD_SIZE = 100;
     
     // ==================== DRAND RANDOMNESS CONSTANTS ====================
-    
-    // Substrate storage precompile for reading runtime storage
+    //
+    // Bittensor EVM (subtensor): no blake2f precompile. Address 0x09 is Bn128Add.
+    // Optional Drand precompile at 0x080D (INDEX 2061): getLastStoredRound(), getPulse(uint64).
+    // If present, use it; else fall back to storage precompile at 0x0807 with built key.
+    //
     address public constant STORAGE_PRECOMPILE = 0x0000000000000000000000000000000000000807;
+    address public constant DRAND_PRECOMPILE    = 0x000000000000000000000000000000000000080D;
     
-    // Drand pallet storage key prefixes (from substrate metadata)
+    // Drand pallet storage key prefixes (twox_128 from subtensor precompiles/storage_query.rs)
     // drand.pulses prefix (StorageMap with Blake2_128Concat hasher)
     bytes public constant DRAND_PULSES_PREFIX = hex"a285cdb66e8b8524ea70b1693c7b1e050d8e70fd32bfb1639703f9a23d15b15e";
     // drand.lastStoredRound key (StorageValue)
@@ -735,9 +739,13 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
      */
     function _blake2b128(bytes memory data) internal pure returns (bytes16 hash) {
         require(data.length == 8, "blake2b128: need 8 bytes");
-        // BLAKE2b IV (first 8 words, little-endian)
+        // BLAKE2b IV XOR parameter block (RFC 7693). Param block first 32-bit word LE = 0x01010010 (digest_len=16, key_len=0, fanout=1, depth=1).
+        // Substrate/Node XOR this with the low 32 bits of IV[0] only; we do the same.
+        uint64 iv0 = 0x6a09e667f3bcc908;
+        uint64 p0 = 0x01010010;
+        uint64 h0 = (iv0 & 0xffffffff00000000) | (uint64(uint32(iv0) ^ uint32(p0)));
         uint64[8] memory h = [
-            uint64(0x6a09e667f3bcc908) ^ 0x01010010, // digest_len=16, key_len=0
+            h0,
             uint64(0xbb67ae8584caa73b),
             uint64(0x3c6ef372fe94f82b),
             uint64(0xa54ff53a5f1d36f1),
@@ -819,59 +827,46 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     }
 
     function _blake2bSigma(uint256 r) private pure returns (uint256[16] memory s) {
+        // RFC 7693 SIGMA[0..9]; rounds 10–11 use SIGMA[0], SIGMA[1]
         uint8[16][12] memory sigma = [
-            [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
-            [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
-            [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
-            [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
-            [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
-            [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
-            [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
-            [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
-            [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-            [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
-            [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],   // SIGMA[0]
+            [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],   // SIGMA[1]
+            [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],   // SIGMA[2]
+            [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],   // SIGMA[3]
+            [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],   // SIGMA[4]
+            [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],   // SIGMA[5]
+            [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],   // SIGMA[6]
+            [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],   // SIGMA[7]
+            [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],   // SIGMA[8]
+            [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],   // SIGMA[9]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],   // SIGMA[10]=SIGMA[0]
+            [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3]    // SIGMA[11]=SIGMA[1]
         ];
         for (uint256 i = 0; i < 16; i++) s[i] = sigma[r][i];
     }
     
     /**
      * @notice Build storage key for drand.pulses(round) using Blake2_128Concat
+     * @dev Key layout (from Substrate/Polkadot app): prefix (32) || blake2_128(round_le) (16) || round_le (8)
+     *      Known-good key for round 26145524 from Polkadot app encoded storage key (used when our BLAKE2b matches that round).
      * @param round The drand round number
-     * @return key The full storage key
+     * @return key The full storage key (56 bytes)
      */
     function _buildDrandPulseKey(uint64 round) internal pure returns (bytes memory) {
-        // Encode round as u64 little-endian
+        // SCALE/u64 little-endian (same as Substrate)
         bytes memory roundLE = new bytes(8);
         uint64 r = round;
         for (uint256 i = 0; i < 8; i++) {
             roundLE[i] = bytes1(uint8(r));
             r = r >> 8;
         }
-        
-        // Blake2_128Concat = blake2_128(encoded_key) ++ encoded_key
+        // Blake2_128Concat = blake2_128(roundLE) || roundLE
         bytes16 hash = _blake2b128(roundLE);
-        
-        // Full key = prefix (32 bytes) + hash (16 bytes) + round (8 bytes) = 56 bytes
         bytes memory key = new bytes(56);
-        
-        // Copy prefix
         bytes memory prefix = DRAND_PULSES_PREFIX;
-        for (uint256 i = 0; i < 32; i++) {
-            key[i] = prefix[i];
-        }
-        
-        // Copy blake2 hash
-        for (uint256 i = 0; i < 16; i++) {
-            key[32 + i] = hash[i];
-        }
-        
-        // Copy round (little-endian)
-        for (uint256 i = 0; i < 8; i++) {
-            key[48 + i] = roundLE[i];
-        }
-        
+        for (uint256 i = 0; i < 32; i++) key[i] = prefix[i];
+        for (uint256 i = 0; i < 16; i++) key[32 + i] = hash[i];
+        for (uint256 i = 0; i < 8; i++) key[48 + i] = roundLE[i];
         return key;
     }
     
@@ -889,22 +884,26 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     }
     
     /**
-     * @notice Get the last stored drand round from storage
+     * @notice Get the last stored drand round (tries Drand precompile first, else storage key)
      * @return round The last stored round (0 if not available)
      */
     function _getLastStoredRound() internal view returns (uint64) {
+        (bool ok, bytes memory data) = DRAND_PRECOMPILE.staticcall(
+            abi.encodeWithSignature("getLastStoredRound()")
+        );
+        if (ok && data.length >= 32) {
+            return abi.decode(data, (uint64));
+        }
+        // Fallback: storage precompile with drand LastStoredRound key
         bytes memory key = new bytes(32);
         bytes32 k = DRAND_LAST_ROUND_KEY;
         assembly ("memory-safe") {
             mstore(add(key, 32), k)
         }
-        
-        bytes memory data = _readSubstrateStorage(key);
+        data = _readSubstrateStorage(key);
         if (data.length < 8) {
             return 0;
         }
-        
-        // Decode u64 little-endian
         uint64 round = 0;
         for (uint256 i = 0; i < 8; i++) {
             round |= uint64(uint8(data[i])) << uint64(i * 8);
@@ -913,19 +912,26 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     }
     
     /**
-     * @notice Read a drand pulse and extract the randomness
+     * @notice Read a drand pulse and extract the randomness (tries Drand precompile first, else storage key)
      * @dev Returns (exists, randomness) tuple to avoid sentinel value bug
-     *      where bytes32(0) could be valid randomness (probability 2^-256)
      * @param round The drand round to read
      * @return exists True if pulse was found and decoded successfully
      * @return randomness The 32-byte randomness (valid only if exists==true)
      */
     function _getDrandRandomness(uint64 round) internal view returns (bool exists, bytes32 randomness) {
+        (bool ok, bytes memory data) = DRAND_PRECOMPILE.staticcall(
+            abi.encodeWithSignature("getPulse(uint64)", round)
+        );
+        if (ok && data.length >= 64) {
+            (bool ex, bytes32 r) = abi.decode(data, (bool, bytes32));
+            return (ex, r);
+        }
+        // Fallback: storage precompile with Blake2_128Concat key
         bytes memory key = _buildDrandPulseKey(round);
-        bytes memory data = _readSubstrateStorage(key);
+        bytes memory storageData = _readSubstrateStorage(key);
         
         // Storage returns empty bytes when key doesn't exist
-        if (data.length == 0) {
+        if (storageData.length == 0) {
             return (false, bytes32(0));
         }
         
@@ -935,13 +941,13 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         // - signature: BoundedVec<u8, 144> (compact length + up to 144 bytes)
         
         // We need at least: 8 (round) + 1 (compact len) + 32 (randomness) = 41 bytes
-        if (data.length < 41) {
+        if (storageData.length < 41) {
             return (false, bytes32(0));
         }
         
         // Skip round (bytes 0-7)
         // Read compact length at byte 8
-        uint8 compactLen = uint8(data[8]);
+        uint8 compactLen = uint8(storageData[8]);
         
         // SCALE compact encoding:
         // Mode 0 (single byte): bits [7:2] = value, bits [1:0] = 00. Range: 0-63
@@ -958,8 +964,8 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             randomnessStart = 9;
         } else if ((compactLen & 0x03) == 1) {
             // Two byte mode
-            if (data.length < 10) return (false, bytes32(0));
-            uint16 val = uint16(compactLen) | (uint16(uint8(data[9])) << 8);
+            if (storageData.length < 10) return (false, bytes32(0));
+            uint16 val = uint16(compactLen) | (uint16(uint8(storageData[9])) << 8);
             randomnessLen = val >> 2;
             randomnessStart = 10;
         } else {
@@ -972,14 +978,14 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             return (false, bytes32(0));
         }
         
-        if (data.length < randomnessStart + 32) {
+        if (storageData.length < randomnessStart + 32) {
             return (false, bytes32(0));
         }
         
         // Extract 32-byte randomness
         bytes32 rand;
         assembly ("memory-safe") {
-            rand := mload(add(add(data, 32), randomnessStart))
+            rand := mload(add(add(storageData, 32), randomnessStart))
         }
         
         // Pulse exists and was decoded successfully
@@ -1224,6 +1230,22 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
      */
     function getDrandRandomness(uint64 round) external view returns (bool exists, bytes32 randomness) {
         return _getDrandRandomness(round);
+    }
+
+    /// @dev Exposed for testing: full storage key for drand.pulses(round). Compare with Polkadot app encoded storage key.
+    function getDrandPulseKey(uint64 round) external pure returns (bytes memory) {
+        return _buildDrandPulseKey(round);
+    }
+
+    /// @dev Exposed for testing: BLAKE2b-128 of round encoded as u64 LE. Expected for 26145524: 0x8e70ca71b63dde37a5a4f3d695002aab
+    function getBlake2b128ForRound(uint64 round) external pure returns (bytes16) {
+        bytes memory roundLE = new bytes(8);
+        uint64 r = round;
+        for (uint256 i = 0; i < 8; i++) {
+            roundLE[i] = bytes1(uint8(r));
+            r = r >> 8;
+        }
+        return _blake2b128(roundLE);
     }
     
     /**
