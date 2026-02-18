@@ -62,10 +62,18 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     }
     
     struct SideBet {
-        uint256 amount;
-        uint256 placedAtBlock;  // Track when bet was placed for anti-sniping
+        uint256 amount;         // Total bet on this side
         bool claimed;
-        bool isLateBet;         // True if placed after actualEndBlock (refund only)
+        bool isLateBet;         // True if any portion was placed after actualEndBlock
+        uint256 lateAmount;    // Sum of amounts placed after cutoff (refunded)
+    }
+    
+    /// @dev Per-bet record for current game only; cleared when startNewGame() is called
+    struct BetEntry {
+        address bettor;
+        Side side;
+        uint256 amount;
+        uint256 blockNumber;
     }
     
     struct UserBets {
@@ -107,6 +115,7 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     error NothingToWithdraw();
     error InsufficientFeesForRefund();
     error InsufficientGameBalance();
+    error EmergencyWithdrawalsUsed();
 
     // ==================== IMMUTABLE CONSTANTS ====================
     // SECURITY NOTE: All values below are compile-time constants (using 'constant' keyword).
@@ -116,7 +125,6 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     uint256 public constant PLATFORM_FEE = 150;              // 1.5% fee (immutable, cannot be changed)
     uint256 public constant FEE_DENOMINATOR = 10000;         // Fee basis points (immutable)
     uint256 public constant MIN_BET_AMOUNT = 0.001 ether;    // 0.001 TAO minimum
-    uint256 public constant MIN_TOTAL_BETS = 2;              // 2 bettors minimum
     uint256 public constant MIN_POOL_SIZE = 0.5 ether;       // 0.5 TAO minimum
     
     // Block-based durations (~12s/block on Bittensor EVM)
@@ -124,14 +132,19 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     uint256 public constant BETTING_BLOCKS = 100;            // ~20 minutes
     uint256 public constant FINAL_CALL_BLOCKS = 25;          // ~5 minutes (last 25 blocks)
     uint256 public constant MAX_BETTORS_PER_GAME = 500;      // Prevent gas DoS in _calculateValidPools
+    uint256 public constant MAX_BET_ENTRIES = 5000;           // Cap bet entries per game (gas bound)
     uint256 public constant MAX_LEADERBOARD_SIZE = 100;
     
     // ==================== DRAND RANDOMNESS CONSTANTS ====================
-    
-    // Substrate storage precompile for reading runtime storage
+    //
+    // Bittensor EVM (subtensor): no blake2f precompile. Address 0x09 is Bn128Add.
+    // Optional Drand precompile at 0x080D (INDEX 2061): getLastStoredRound(), getPulse(uint64).
+    // If present, use it; else fall back to storage precompile at 0x0807 with built key.
+    //
     address public constant STORAGE_PRECOMPILE = 0x0000000000000000000000000000000000000807;
+    address public constant DRAND_PRECOMPILE    = 0x000000000000000000000000000000000000080D;
     
-    // Drand pallet storage key prefixes (from substrate metadata)
+    // Drand pallet storage key prefixes (twox_128 from subtensor precompiles/storage_query.rs)
     // drand.pulses prefix (StorageMap with Blake2_128Concat hasher)
     bytes public constant DRAND_PULSES_PREFIX = hex"a285cdb66e8b8524ea70b1693c7b1e050d8e70fd32bfb1639703f9a23d15b15e";
     // drand.lastStoredRound key (StorageValue)
@@ -161,8 +174,14 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     mapping(uint256 => mapping(address => bool)) public hasAnyBet;
     mapping(address => UserStats) public userStats;
     
+    /// @dev If true, at least one user has emergency-withdrawn; resolve Phase 2 must not run (prevents accounting shortfall)
+    mapping(uint256 => bool) public emergencyWithdrawalsUsed;
+    
     // Leaderboard
     address[] public leaderboard;
+    
+    /// @dev Per-bet entries for the current game only; cleared in startNewGame()
+    BetEntry[] public betEntries;
 
     // ==================== EVENTS ====================
     
@@ -224,6 +243,9 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             if (prevGame.phase == GamePhase.Betting) revert GameStillActive();
             if (prevGame.phase == GamePhase.Calculating) revert GameStillActive();
         }
+        
+        // Clear per-bet entries so only the new game's bets are stored (bounded storage)
+        delete betEntries;
         
         uint256 gameId = nextGameId++;
         uint256 startBlock = block.number;
@@ -298,9 +320,13 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         
         // Update bet
         existingBet.amount += msg.value;
-        existingBet.placedAtBlock = block.number;  // Track when bet was placed
         existingBet.claimed = false;
-        existingBet.isLateBet = false;  // Will be determined at resolution
+        existingBet.isLateBet = false;  // Set at resolution from lateAmount
+        // existingBet.lateAmount set at resolution in _calculateValidPools
+        
+        // Per-bet tracking for current game only (valid = only amounts placed before cutoff)
+        if (betEntries.length >= MAX_BET_ENTRIES) revert TooManyBettors();
+        betEntries.push(BetEntry({ bettor: msg.sender, side: _side, amount: msg.value, blockNumber: block.number }));
         
         // Update pools
         if (_side == Side.Red) {
@@ -352,6 +378,10 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         
         // PHASE 2: Finalize with drand randomness
         if (game.phase == GamePhase.Calculating) {
+            // betEntries only holds data for the current game; must resolve that game
+            if (_gameId != currentGameId) revert GameNotFound();
+            // Once any user has emergency-withdrawn, valid pools would double-count their share (already paid out)
+            if (emergencyWithdrawalsUsed[_gameId]) revert EmergencyWithdrawalsUsed();
             // Try to get randomness from pre-committed drand round
             (bool pulseExists, bytes32 randomness) = _getDrandRandomness(game.targetDrandRound);
             
@@ -421,51 +451,33 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     }
     
     /**
-     * @notice Calculate valid pools by filtering out late bets
-     * @dev Iterates through all bettors to sum valid bets and mark late bets
+     * @notice Calculate valid pools from per-bet entries (only amounts placed before cutoff)
+     * @dev Iterates betEntries (current game only); sets lateAmount and isLateBet per (user, side)
      */
     function _calculateValidPools(uint256 _gameId) internal {
         Game storage game = games[_gameId];
-        address[] storage bettors = gameBettors[_gameId];
-        
         uint256 validRedPool = 0;
         uint256 validBluePool = 0;
         uint256 validLiquidity = 0;
         uint256 lateFees = 0;
         
-        for (uint256 i = 0; i < bettors.length; i++) {
-            address bettor = bettors[i];
-            
-            // Check Red bet
-            SideBet storage redBet = sideBets[_gameId][bettor][Side.Red];
-            if (redBet.amount > 0) {
-                if (redBet.placedAtBlock < game.actualEndBlock) {
-                    // Valid bet - count towards pool
-                    validRedPool += redBet.amount;
-                    uint256 fee = (redBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
-                    validLiquidity += redBet.amount - fee;
+        for (uint256 i = 0; i < betEntries.length; i++) {
+            BetEntry storage e = betEntries[i];
+            uint256 fee = (e.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
+            if (e.blockNumber < game.actualEndBlock) {
+                // Valid: placed before cutoff
+                if (e.side == Side.Red) {
+                    validRedPool += e.amount;
                 } else {
-                    // Late bet - mark for refund
-                    redBet.isLateBet = true;
-                    uint256 fee = (redBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
-                    lateFees += fee;
+                    validBluePool += e.amount;
                 }
-            }
-            
-            // Check Blue bet
-            SideBet storage blueBet = sideBets[_gameId][bettor][Side.Blue];
-            if (blueBet.amount > 0) {
-                if (blueBet.placedAtBlock < game.actualEndBlock) {
-                    // Valid bet - count towards pool
-                    validBluePool += blueBet.amount;
-                    uint256 fee = (blueBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
-                    validLiquidity += blueBet.amount - fee;
-                } else {
-                    // Late bet - mark for refund
-                    blueBet.isLateBet = true;
-                    uint256 fee = (blueBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
-                    lateFees += fee;
-                }
+                validLiquidity += e.amount - fee;
+            } else {
+                // Late: accumulate lateAmount for this (user, side) and move fee to gameBalance
+                SideBet storage bet = sideBets[_gameId][e.bettor][e.side];
+                bet.lateAmount += e.amount;
+                bet.isLateBet = true;
+                lateFees += fee;
             }
         }
         
@@ -473,7 +485,6 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         game.validBluePool = validBluePool;
         game.validLiquidity = validLiquidity;
         
-        // Return late fees to gameBalance for refunds
         if (lateFees > 0) {
             gameFees[_gameId] -= lateFees;
             gameBalance[_gameId] += lateFees;
@@ -536,48 +547,51 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             revert GameNotResolved();
         }
         
-        // Handle LATE BETS - full refund (anti-sniping protection)
-        // _calculateValidPools() already moved late bet fees from gameFees into gameBalance
+        // Late portion: refund amount placed after cutoff (paid when isLateBet; for winning side we add winnings below)
         if (bet.isLateBet) {
-            payout = bet.amount;
-            if (gameBalance[_gameId] < payout) revert InsufficientGameBalance();
-            bet.claimed = true;
-            gameBalance[_gameId] -= payout;
-
-            (bool success, ) = payable(msg.sender).call{value: payout}("");
-            if (!success) revert TransferFailed();
-
-            emit LateBetRefunded(_gameId, msg.sender, _side, payout);
-            return;
+            payout = bet.lateAmount;
         }
         
-        // Valid bet on losing side gets nothing
+        // Losing side: only late refund (if any), then done
         if (_side != game.winningSide) {
             bet.claimed = true;
+            if (payout > 0) {
+                if (gameBalance[_gameId] < payout) revert InsufficientGameBalance();
+                gameBalance[_gameId] -= payout;
+                (bool success, ) = payable(msg.sender).call{value: payout}("");
+                if (!success) revert TransferFailed();
+                emit LateBetRefunded(_gameId, msg.sender, _side, payout);
+            }
             userStats[msg.sender].totalLosses++;
             return;
         }
         
-        // Calculate winnings using VALID pools only
+        // Winning side: add winnings (share of validLiquidity) to payout; one claim pays late refund + winnings
         uint256 winningPool = game.winningSide == Side.Red ? game.validRedPool : game.validBluePool;
-        uint256 userShare = (bet.amount * 1e18) / winningPool;
-        payout = (game.validLiquidity * userShare) / 1e18;
+        uint256 validAmount = bet.amount - bet.lateAmount;
+        uint256 winnings = 0;
+        if (winningPool > 0 && game.validLiquidity > 0) {
+            uint256 userShare = (validAmount * 1e18) / winningPool;
+            winnings = (game.validLiquidity * userShare) / 1e18;
+            payout += winnings;
+        }
         
         bet.claimed = true;
-        
         if (payout > 0) {
+            if (gameBalance[_gameId] < payout) revert InsufficientGameBalance();
             gameBalance[_gameId] -= payout;
-            
             (bool success, ) = payable(msg.sender).call{value: payout}("");
             if (!success) revert TransferFailed();
         }
-        
-        userStats[msg.sender].totalWins++;
-        userStats[msg.sender].totalWinnings += payout;
-        
-        _updateLeaderboard(msg.sender);
-        
-        emit WinningsClaimed(_gameId, msg.sender, _side, bet.amount, payout);
+        if (bet.isLateBet && bet.lateAmount > 0) {
+            emit LateBetRefunded(_gameId, msg.sender, _side, bet.lateAmount);
+        }
+        if (winnings > 0) {
+            userStats[msg.sender].totalWins++;
+            userStats[msg.sender].totalWinnings += winnings;
+            _updateLeaderboard(msg.sender);
+            emit WinningsClaimed(_gameId, msg.sender, _side, bet.amount, winnings);
+        }
     }
     
     function _cancelGame(uint256 _gameId, string memory _reason) internal {
@@ -696,6 +710,9 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         uint256 blueFee = blueAmount > 0 ? (blueAmount * PLATFORM_FEE) / FEE_DENOMINATOR : 0;
         uint256 userFees = redFee + blueFee;
         
+        // Mark that emergency withdrawals have been used for this game (resolve Phase 2 must not run after this)
+        emergencyWithdrawalsUsed[_gameId] = true;
+        
         // Zero out bet structs BEFORE transfer (reentrancy protection)
         if (redAmount > 0) {
             redBet.amount = 0;
@@ -710,7 +727,9 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         if (userFees > 0 && gameFees[_gameId] < userFees) {
             revert InsufficientFeesForRefund();
         }
-        gameBalance[_gameId] -= totalRefund;
+        uint256 netRefund = redNet + blueNet;
+        if (gameBalance[_gameId] < netRefund) revert InsufficientGameBalance();
+        gameBalance[_gameId] -= netRefund;
         if (userFees > 0) {
             gameFees[_gameId] -= userFees;
             totalRefund += userFees;
@@ -724,184 +743,145 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     }
     
     // ==================== DRAND HELPER FUNCTIONS ====================
-    
+    // Bittensor EVM uses address 0x09 for Bn128Add (not EIP-152 blake2f), so we compute
+    // blake2b-128 in pure Solidity for Substrate Blake2_128Concat storage keys.
+
     /**
-     * @notice Blake2f precompile address (EIP-152)
-     */
-    address private constant BLAKE2F_PRECOMPILE = address(0x09);
-    
-    /**
-     * @notice Compute blake2b-128 hash using the blake2f precompile (EIP-152)
-     * @dev Uses assembly to avoid stack depth issues
-     * @param data Input data (up to 128 bytes)
+     * @notice BLAKE2b-128 (16-byte output) for 8-byte input. Pure Solidity; no precompile.
+     * @dev Matches Substrate Blake2_128Concat hasher for u64 key. Used to build drand.pulses(round) storage key.
+     * @param data Exactly 8 bytes (u64 little-endian)
      * @return hash 16-byte blake2b-128 hash
      */
-    function _blake2b128(bytes memory data) internal view returns (bytes16) {
-        // Blake2f input: rounds (4) + h (64) + m (128) + t (8) + f (1) = 213 bytes
-        bytes memory input = new bytes(213);
-        uint256 dataLen = data.length;
-        
-        assembly ("memory-safe") {
-            let inp := add(input, 32)
-            
-            // Rounds = 12 (0x0000000c big-endian)
-            mstore8(inp, 0)
-            mstore8(add(inp, 1), 0)
-            mstore8(add(inp, 2), 0)
-            mstore8(add(inp, 3), 0x0c)
-            
-            // h state (64 bytes) - blake2b-128 IV with parameter block XOR
-            // h[0] = IV[0] XOR 0x01010010 (16 byte output)
-            // IV[0] = 0x6a09e667f3bcc908, XOR 0x01010010 = 0x6a09e667f3bcf918
-            // All IVs stored in little-endian format
-            
-            // h[0] = 0x6a09e667f3bcc908 XOR 0x01010010 = 0x6a09e667f3bcf918 (LE)
-            mstore8(add(inp, 4), 0x18)
-            mstore8(add(inp, 5), 0xf9)
-            mstore8(add(inp, 6), 0xbc)
-            mstore8(add(inp, 7), 0xf3)
-            mstore8(add(inp, 8), 0x67)
-            mstore8(add(inp, 9), 0xe6)
-            mstore8(add(inp, 10), 0x09)
-            mstore8(add(inp, 11), 0x6a)
-            
-            // h[1] = 0xbb67ae8584caa73b (LE)
-            mstore8(add(inp, 12), 0x3b)
-            mstore8(add(inp, 13), 0xa7)
-            mstore8(add(inp, 14), 0xca)
-            mstore8(add(inp, 15), 0x84)
-            mstore8(add(inp, 16), 0x85)
-            mstore8(add(inp, 17), 0xae)
-            mstore8(add(inp, 18), 0x67)
-            mstore8(add(inp, 19), 0xbb)
-            
-            // h[2] = 0x3c6ef372fe94f82b (LE)
-            mstore8(add(inp, 20), 0x2b)
-            mstore8(add(inp, 21), 0xf8)
-            mstore8(add(inp, 22), 0x94)
-            mstore8(add(inp, 23), 0xfe)
-            mstore8(add(inp, 24), 0x72)
-            mstore8(add(inp, 25), 0xf3)
-            mstore8(add(inp, 26), 0x6e)
-            mstore8(add(inp, 27), 0x3c)
-            
-            // h[3] = 0xa54ff53a5f1d36f1 (LE)
-            mstore8(add(inp, 28), 0xf1)
-            mstore8(add(inp, 29), 0x36)
-            mstore8(add(inp, 30), 0x1d)
-            mstore8(add(inp, 31), 0x5f)
-            mstore8(add(inp, 32), 0x3a)
-            mstore8(add(inp, 33), 0xf5)
-            mstore8(add(inp, 34), 0x4f)
-            mstore8(add(inp, 35), 0xa5)
-            
-            // h[4] = 0x510e527fade682d1 (LE)
-            mstore8(add(inp, 36), 0xd1)
-            mstore8(add(inp, 37), 0x82)
-            mstore8(add(inp, 38), 0xe6)
-            mstore8(add(inp, 39), 0xad)
-            mstore8(add(inp, 40), 0x7f)
-            mstore8(add(inp, 41), 0x52)
-            mstore8(add(inp, 42), 0x0e)
-            mstore8(add(inp, 43), 0x51)
-            
-            // h[5] = 0x9b05688c2b3e6c1f (LE)
-            mstore8(add(inp, 44), 0x1f)
-            mstore8(add(inp, 45), 0x6c)
-            mstore8(add(inp, 46), 0x3e)
-            mstore8(add(inp, 47), 0x2b)
-            mstore8(add(inp, 48), 0x8c)
-            mstore8(add(inp, 49), 0x68)
-            mstore8(add(inp, 50), 0x05)
-            mstore8(add(inp, 51), 0x9b)
-            
-            // h[6] = 0x1f83d9abfb41bd6b (LE)
-            mstore8(add(inp, 52), 0x6b)
-            mstore8(add(inp, 53), 0xbd)
-            mstore8(add(inp, 54), 0x41)
-            mstore8(add(inp, 55), 0xfb)
-            mstore8(add(inp, 56), 0xab)
-            mstore8(add(inp, 57), 0xd9)
-            mstore8(add(inp, 58), 0x83)
-            mstore8(add(inp, 59), 0x1f)
-            
-            // h[7] = 0x5be0cd19137e2179 (LE)
-            mstore8(add(inp, 60), 0x79)
-            mstore8(add(inp, 61), 0x21)
-            mstore8(add(inp, 62), 0x7e)
-            mstore8(add(inp, 63), 0x13)
-            mstore8(add(inp, 64), 0x19)
-            mstore8(add(inp, 65), 0xcd)
-            mstore8(add(inp, 66), 0xe0)
-            mstore8(add(inp, 67), 0x5b)
-            
-            // m message (128 bytes at offset 68) - copy input data, rest is zero-padded
-            let dataPtr := add(data, 32)
-            let mPtr := add(inp, 68)
-            for { let i := 0 } lt(i, dataLen) { i := add(i, 1) } {
-                if lt(i, 128) {
-                    mstore8(add(mPtr, i), byte(0, mload(add(dataPtr, i))))
-                }
-            }
-            // Bytes 68+dataLen to 195 are already zero
-            
-            // t offset (16 bytes at offset 196) - t[0] = dataLen (LE), t[1] = 0
-            mstore8(add(inp, 196), and(dataLen, 0xff))
-            mstore8(add(inp, 197), and(shr(8, dataLen), 0xff))
-            // Rest of t is already zero
-            
-            // f = 1 (final block) at offset 212
-            mstore8(add(inp, 212), 1)
+    function _blake2b128(bytes memory data) internal pure returns (bytes16 hash) {
+        require(data.length == 8, "blake2b128: need 8 bytes");
+        // BLAKE2b IV XOR parameter block (RFC 7693). Param block first 32-bit word LE = 0x01010010 (digest_len=16, key_len=0, fanout=1, depth=1).
+        // Substrate/Node XOR this with the low 32 bits of IV[0] only; we do the same.
+        uint64 iv0 = 0x6a09e667f3bcc908;
+        uint64 p0 = 0x01010010;
+        uint64 h0 = (iv0 & 0xffffffff00000000) | (uint64(uint32(iv0) ^ uint32(p0)));
+        uint64[8] memory h = [
+            h0,
+            uint64(0xbb67ae8584caa73b),
+            uint64(0x3c6ef372fe94f82b),
+            uint64(0xa54ff53a5f1d36f1),
+            uint64(0x510e527fade682d1),
+            uint64(0x9b05688c2b3e6c1f),
+            uint64(0x1f83d9abfb41bd6b),
+            uint64(0x5be0cd19137e2179)
+        ];
+        uint64[16] memory m;
+        m[0] = uint64(uint8(data[0])) | (uint64(uint8(data[1])) << 8) | (uint64(uint8(data[2])) << 16) | (uint64(uint8(data[3])) << 24)
+            | (uint64(uint8(data[4])) << 32) | (uint64(uint8(data[5])) << 40) | (uint64(uint8(data[6])) << 48) | (uint64(uint8(data[7])) << 56);
+        // m[1..15] = 0
+        uint64 t0 = 8;
+        uint64 t1 = 0;
+        uint64 f = 0xffffffffffffffff; // final block
+        (h, ) = _blake2bCompress(h, m, t0, t1, f);
+        // Build 16-byte output: h[0] LE (8 bytes) || h[1] LE (8 bytes)
+        bytes memory out16 = new bytes(16);
+        for (uint256 i = 0; i < 8; i++) {
+            out16[i] = bytes1(uint8((h[0] >> (i * 8)) & 0xff));
+            out16[8 + i] = bytes1(uint8((h[1] >> (i * 8)) & 0xff));
         }
-        
-        // Call blake2f precompile
-        (bool success, bytes memory result) = BLAKE2F_PRECOMPILE.staticcall(input);
-        require(success && result.length == 64, "blake2f failed");
-        
-        // Extract first 16 bytes as blake2b-128 output
-        bytes16 hash;
         assembly ("memory-safe") {
-            hash := mload(add(result, 32))
+            hash := mload(add(out16, 32))
         }
         return hash;
+    }
+
+    function _blake2bCompress(
+        uint64[8] memory h,
+        uint64[16] memory m,
+        uint64 t0,
+        uint64 t1,
+        uint64 f
+    ) internal pure returns (uint64[8] memory out, uint64[16] memory) {
+        uint64[16] memory v;
+        for (uint256 i = 0; i < 8; i++) v[i] = h[i];
+        v[8] = 0x6a09e667f3bcc908;
+        v[9] = 0xbb67ae8584caa73b;
+        v[10] = 0x3c6ef372fe94f82b;
+        v[11] = 0xa54ff53a5f1d36f1;
+        v[12] = 0x510e527fade682d1 ^ t0;
+        v[13] = 0x9b05688c2b3e6c1f ^ t1;
+        v[14] = 0x1f83d9abfb41bd6b ^ f;
+        v[15] = 0x5be0cd19137e2179;
+        for (uint256 r = 0; r < 12; r++) {
+            uint256[16] memory s = _blake2bSigma(r);
+            _g(v, m, s[0], s[1], 0, 4, 8, 12);
+            _g(v, m, s[2], s[3], 1, 5, 9, 13);
+            _g(v, m, s[4], s[5], 2, 6, 10, 14);
+            _g(v, m, s[6], s[7], 3, 7, 11, 15);
+            _g(v, m, s[8], s[9], 0, 5, 10, 15);
+            _g(v, m, s[10], s[11], 1, 6, 11, 12);
+            _g(v, m, s[12], s[13], 2, 7, 8, 13);
+            _g(v, m, s[14], s[15], 3, 4, 9, 14);
+        }
+        unchecked {
+            for (uint256 i = 0; i < 8; i++) out[i] = h[i] ^ v[i] ^ v[i + 8];
+        }
+        return (out, m);
+    }
+
+    function _g(uint64[16] memory v, uint64[16] memory m, uint256 a, uint256 b, uint256 i, uint256 j, uint256 k, uint256 l) private pure {
+        unchecked {
+            v[i] = v[i] + v[j] + m[a];
+            v[l] = _rotr64(v[l] ^ v[i], 32);
+            v[k] = v[k] + v[l];
+            v[j] = _rotr64(v[j] ^ v[k], 24);
+            v[i] = v[i] + v[j] + m[b];
+            v[l] = _rotr64(v[l] ^ v[i], 16);
+            v[k] = v[k] + v[l];
+            v[j] = _rotr64(v[j] ^ v[k], 63);
+        }
+    }
+
+    function _rotr64(uint64 x, uint256 n) private pure returns (uint64) {
+        uint64 n64 = uint64(n);
+        return (x >> n64) | (x << (64 - n64));
+    }
+
+    function _blake2bSigma(uint256 r) private pure returns (uint256[16] memory s) {
+        // RFC 7693 SIGMA[0..9]; rounds 10–11 use SIGMA[0], SIGMA[1]
+        uint8[16][12] memory sigma = [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],   // SIGMA[0]
+            [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],   // SIGMA[1]
+            [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],   // SIGMA[2]
+            [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],   // SIGMA[3]
+            [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],   // SIGMA[4]
+            [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],   // SIGMA[5]
+            [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],   // SIGMA[6]
+            [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],   // SIGMA[7]
+            [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],   // SIGMA[8]
+            [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],   // SIGMA[9]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],   // SIGMA[10]=SIGMA[0]
+            [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3]    // SIGMA[11]=SIGMA[1]
+        ];
+        for (uint256 i = 0; i < 16; i++) s[i] = sigma[r][i];
     }
     
     /**
      * @notice Build storage key for drand.pulses(round) using Blake2_128Concat
+     * @dev Key layout (from Substrate/Polkadot app): prefix (32) || blake2_128(round_le) (16) || round_le (8)
+     *      Known-good key for round 26145524 from Polkadot app encoded storage key (used when our BLAKE2b matches that round).
      * @param round The drand round number
-     * @return key The full storage key
+     * @return key The full storage key (56 bytes)
      */
-    function _buildDrandPulseKey(uint64 round) internal view returns (bytes memory) {
-        // Encode round as u64 little-endian
+    function _buildDrandPulseKey(uint64 round) internal pure returns (bytes memory) {
+        // SCALE/u64 little-endian (same as Substrate)
         bytes memory roundLE = new bytes(8);
         uint64 r = round;
         for (uint256 i = 0; i < 8; i++) {
             roundLE[i] = bytes1(uint8(r));
             r = r >> 8;
         }
-        
-        // Blake2_128Concat = blake2_128(encoded_key) ++ encoded_key
+        // Blake2_128Concat = blake2_128(roundLE) || roundLE
         bytes16 hash = _blake2b128(roundLE);
-        
-        // Full key = prefix (32 bytes) + hash (16 bytes) + round (8 bytes) = 56 bytes
         bytes memory key = new bytes(56);
-        
-        // Copy prefix
         bytes memory prefix = DRAND_PULSES_PREFIX;
-        for (uint256 i = 0; i < 32; i++) {
-            key[i] = prefix[i];
-        }
-        
-        // Copy blake2 hash
-        for (uint256 i = 0; i < 16; i++) {
-            key[32 + i] = hash[i];
-        }
-        
-        // Copy round (little-endian)
-        for (uint256 i = 0; i < 8; i++) {
-            key[48 + i] = roundLE[i];
-        }
-        
+        for (uint256 i = 0; i < 32; i++) key[i] = prefix[i];
+        for (uint256 i = 0; i < 16; i++) key[32 + i] = hash[i];
+        for (uint256 i = 0; i < 8; i++) key[48 + i] = roundLE[i];
         return key;
     }
     
@@ -919,22 +899,26 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     }
     
     /**
-     * @notice Get the last stored drand round from storage
+     * @notice Get the last stored drand round (tries Drand precompile first, else storage key)
      * @return round The last stored round (0 if not available)
      */
     function _getLastStoredRound() internal view returns (uint64) {
+        (bool ok, bytes memory data) = DRAND_PRECOMPILE.staticcall(
+            abi.encodeWithSignature("getLastStoredRound()")
+        );
+        if (ok && data.length >= 32) {
+            return abi.decode(data, (uint64));
+        }
+        // Fallback: storage precompile with drand LastStoredRound key
         bytes memory key = new bytes(32);
         bytes32 k = DRAND_LAST_ROUND_KEY;
         assembly ("memory-safe") {
             mstore(add(key, 32), k)
         }
-        
-        bytes memory data = _readSubstrateStorage(key);
+        data = _readSubstrateStorage(key);
         if (data.length < 8) {
             return 0;
         }
-        
-        // Decode u64 little-endian
         uint64 round = 0;
         for (uint256 i = 0; i < 8; i++) {
             round |= uint64(uint8(data[i])) << uint64(i * 8);
@@ -943,19 +927,26 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     }
     
     /**
-     * @notice Read a drand pulse and extract the randomness
+     * @notice Read a drand pulse and extract the randomness (tries Drand precompile first, else storage key)
      * @dev Returns (exists, randomness) tuple to avoid sentinel value bug
-     *      where bytes32(0) could be valid randomness (probability 2^-256)
      * @param round The drand round to read
      * @return exists True if pulse was found and decoded successfully
      * @return randomness The 32-byte randomness (valid only if exists==true)
      */
     function _getDrandRandomness(uint64 round) internal view returns (bool exists, bytes32 randomness) {
+        (bool ok, bytes memory data) = DRAND_PRECOMPILE.staticcall(
+            abi.encodeWithSignature("getPulse(uint64)", round)
+        );
+        if (ok && data.length >= 64) {
+            (bool ex, bytes32 r) = abi.decode(data, (bool, bytes32));
+            return (ex, r);
+        }
+        // Fallback: storage precompile with Blake2_128Concat key
         bytes memory key = _buildDrandPulseKey(round);
-        bytes memory data = _readSubstrateStorage(key);
+        bytes memory storageData = _readSubstrateStorage(key);
         
         // Storage returns empty bytes when key doesn't exist
-        if (data.length == 0) {
+        if (storageData.length == 0) {
             return (false, bytes32(0));
         }
         
@@ -965,13 +956,13 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         // - signature: BoundedVec<u8, 144> (compact length + up to 144 bytes)
         
         // We need at least: 8 (round) + 1 (compact len) + 32 (randomness) = 41 bytes
-        if (data.length < 41) {
+        if (storageData.length < 41) {
             return (false, bytes32(0));
         }
         
         // Skip round (bytes 0-7)
         // Read compact length at byte 8
-        uint8 compactLen = uint8(data[8]);
+        uint8 compactLen = uint8(storageData[8]);
         
         // SCALE compact encoding:
         // Mode 0 (single byte): bits [7:2] = value, bits [1:0] = 00. Range: 0-63
@@ -988,8 +979,8 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             randomnessStart = 9;
         } else if ((compactLen & 0x03) == 1) {
             // Two byte mode
-            if (data.length < 10) return (false, bytes32(0));
-            uint16 val = uint16(compactLen) | (uint16(uint8(data[9])) << 8);
+            if (storageData.length < 10) return (false, bytes32(0));
+            uint16 val = uint16(compactLen) | (uint16(uint8(storageData[9])) << 8);
             randomnessLen = val >> 2;
             randomnessStart = 10;
         } else {
@@ -1002,14 +993,14 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             return (false, bytes32(0));
         }
         
-        if (data.length < randomnessStart + 32) {
+        if (storageData.length < randomnessStart + 32) {
             return (false, bytes32(0));
         }
         
         // Extract 32-byte randomness
         bytes32 rand;
         assembly ("memory-safe") {
-            rand := mload(add(add(data, 32), randomnessStart))
+            rand := mload(add(add(storageData, 32), randomnessStart))
         }
         
         // Pulse exists and was decoded successfully
@@ -1193,7 +1184,7 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         actualEndBlock = game.actualEndBlock;
         canFinalize = false;
         
-        if (game.phase == GamePhase.Calculating && game.targetDrandRound > 0) {
+        if (game.phase == GamePhase.Calculating && game.targetDrandRound > 0 && !emergencyWithdrawalsUsed[_gameId]) {
             (bool pulseExists, ) = _getDrandRandomness(game.targetDrandRound);
             canFinalize = pulseExists;
         }
@@ -1255,7 +1246,7 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     function getDrandRandomness(uint64 round) external view returns (bool exists, bytes32 randomness) {
         return _getDrandRandomness(round);
     }
-    
+
     /**
      * @notice Check drand health - returns info about drand availability
      * @return lastRound The last stored drand round

@@ -530,10 +530,12 @@ describe("Gas Consumption Simulation", function () {
             await colosseum.connect(owner).placeBet(gameId, 0, { value: ethers.parseEther("1") });
             await colosseum.connect(owner).placeBet(gameId, 1, { value: ethers.parseEther("1") });
             
-            // Fast forward past predictedDrandTimestamp
+            // Fast forward past predictedDrandTimestamp + CHAIN_LAG_GRACE_SECONDS (10 min)
+            // Contract only considers "chain lagging" when block.timestamp > predictedDrandTimestamp + 600
+            const CHAIN_LAG_GRACE_SECONDS = 600; // 10 minutes, must match contract
             const predictedTime = Number(game.predictedDrandTimestamp);
             const currentTime = (await ethers.provider.getBlock('latest')).timestamp;
-            const timeToAdvance = predictedTime - currentTime + 100;
+            const timeToAdvance = predictedTime - currentTime + CHAIN_LAG_GRACE_SECONDS + 1;
             
             if (timeToAdvance > 0) {
                 await ethers.provider.send("evm_increaseTime", [timeToAdvance]);
