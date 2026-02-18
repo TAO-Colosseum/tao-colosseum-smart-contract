@@ -62,10 +62,18 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     }
     
     struct SideBet {
-        uint256 amount;
-        uint256 placedAtBlock;  // Track when bet was placed for anti-sniping
+        uint256 amount;         // Total bet on this side
         bool claimed;
-        bool isLateBet;         // True if placed after actualEndBlock (refund only)
+        bool isLateBet;         // True if any portion was placed after actualEndBlock
+        uint256 lateAmount;    // Sum of amounts placed after cutoff (refunded)
+    }
+    
+    /// @dev Per-bet record for current game only; cleared when startNewGame() is called
+    struct BetEntry {
+        address bettor;
+        Side side;
+        uint256 amount;
+        uint256 blockNumber;
     }
     
     struct UserBets {
@@ -124,6 +132,7 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     uint256 public constant BETTING_BLOCKS = 100;            // ~20 minutes
     uint256 public constant FINAL_CALL_BLOCKS = 25;          // ~5 minutes (last 25 blocks)
     uint256 public constant MAX_BETTORS_PER_GAME = 500;      // Prevent gas DoS in _calculateValidPools
+    uint256 public constant MAX_BET_ENTRIES = 5000;           // Cap bet entries per game (gas bound)
     uint256 public constant MAX_LEADERBOARD_SIZE = 100;
     
     // ==================== DRAND RANDOMNESS CONSTANTS ====================
@@ -167,6 +176,9 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     
     // Leaderboard
     address[] public leaderboard;
+    
+    /// @dev Per-bet entries for the current game only; cleared in startNewGame()
+    BetEntry[] public betEntries;
 
     // ==================== EVENTS ====================
     
@@ -228,6 +240,9 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             if (prevGame.phase == GamePhase.Betting) revert GameStillActive();
             if (prevGame.phase == GamePhase.Calculating) revert GameStillActive();
         }
+        
+        // Clear per-bet entries so only the new game's bets are stored (bounded storage)
+        delete betEntries;
         
         uint256 gameId = nextGameId++;
         uint256 startBlock = block.number;
@@ -302,9 +317,13 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         
         // Update bet
         existingBet.amount += msg.value;
-        existingBet.placedAtBlock = block.number;  // Track when bet was placed
         existingBet.claimed = false;
-        existingBet.isLateBet = false;  // Will be determined at resolution
+        existingBet.isLateBet = false;  // Set at resolution from lateAmount
+        // existingBet.lateAmount set at resolution in _calculateValidPools
+        
+        // Per-bet tracking for current game only (valid = only amounts placed before cutoff)
+        if (betEntries.length >= MAX_BET_ENTRIES) revert TooManyBettors();
+        betEntries.push(BetEntry({ bettor: msg.sender, side: _side, amount: msg.value, blockNumber: block.number }));
         
         // Update pools
         if (_side == Side.Red) {
@@ -356,6 +375,8 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         
         // PHASE 2: Finalize with drand randomness
         if (game.phase == GamePhase.Calculating) {
+            // betEntries only holds data for the current game; must resolve that game
+            if (_gameId != currentGameId) revert GameNotFound();
             // Try to get randomness from pre-committed drand round
             (bool pulseExists, bytes32 randomness) = _getDrandRandomness(game.targetDrandRound);
             
@@ -425,51 +446,33 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     }
     
     /**
-     * @notice Calculate valid pools by filtering out late bets
-     * @dev Iterates through all bettors to sum valid bets and mark late bets
+     * @notice Calculate valid pools from per-bet entries (only amounts placed before cutoff)
+     * @dev Iterates betEntries (current game only); sets lateAmount and isLateBet per (user, side)
      */
     function _calculateValidPools(uint256 _gameId) internal {
         Game storage game = games[_gameId];
-        address[] storage bettors = gameBettors[_gameId];
-        
         uint256 validRedPool = 0;
         uint256 validBluePool = 0;
         uint256 validLiquidity = 0;
         uint256 lateFees = 0;
         
-        for (uint256 i = 0; i < bettors.length; i++) {
-            address bettor = bettors[i];
-            
-            // Check Red bet
-            SideBet storage redBet = sideBets[_gameId][bettor][Side.Red];
-            if (redBet.amount > 0) {
-                if (redBet.placedAtBlock < game.actualEndBlock) {
-                    // Valid bet - count towards pool
-                    validRedPool += redBet.amount;
-                    uint256 fee = (redBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
-                    validLiquidity += redBet.amount - fee;
+        for (uint256 i = 0; i < betEntries.length; i++) {
+            BetEntry storage e = betEntries[i];
+            uint256 fee = (e.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
+            if (e.blockNumber < game.actualEndBlock) {
+                // Valid: placed before cutoff
+                if (e.side == Side.Red) {
+                    validRedPool += e.amount;
                 } else {
-                    // Late bet - mark for refund
-                    redBet.isLateBet = true;
-                    uint256 fee = (redBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
-                    lateFees += fee;
+                    validBluePool += e.amount;
                 }
-            }
-            
-            // Check Blue bet
-            SideBet storage blueBet = sideBets[_gameId][bettor][Side.Blue];
-            if (blueBet.amount > 0) {
-                if (blueBet.placedAtBlock < game.actualEndBlock) {
-                    // Valid bet - count towards pool
-                    validBluePool += blueBet.amount;
-                    uint256 fee = (blueBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
-                    validLiquidity += blueBet.amount - fee;
-                } else {
-                    // Late bet - mark for refund
-                    blueBet.isLateBet = true;
-                    uint256 fee = (blueBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
-                    lateFees += fee;
-                }
+                validLiquidity += e.amount - fee;
+            } else {
+                // Late: accumulate lateAmount for this (user, side) and move fee to gameBalance
+                SideBet storage bet = sideBets[_gameId][e.bettor][e.side];
+                bet.lateAmount += e.amount;
+                bet.isLateBet = true;
+                lateFees += fee;
             }
         }
         
@@ -477,7 +480,6 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         game.validBluePool = validBluePool;
         game.validLiquidity = validLiquidity;
         
-        // Return late fees to gameBalance for refunds
         if (lateFees > 0) {
             gameFees[_gameId] -= lateFees;
             gameBalance[_gameId] += lateFees;
@@ -540,10 +542,10 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             revert GameNotResolved();
         }
         
-        // Handle LATE BETS - full refund (anti-sniping protection)
+        // Handle LATE BETS - refund only the portion placed after cutoff
         // _calculateValidPools() already moved late bet fees from gameFees into gameBalance
         if (bet.isLateBet) {
-            payout = bet.amount;
+            payout = bet.lateAmount;
             if (gameBalance[_gameId] < payout) revert InsufficientGameBalance();
             bet.claimed = true;
             gameBalance[_gameId] -= payout;
@@ -562,9 +564,10 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             return;
         }
         
-        // Calculate winnings using VALID pools only
+        // Calculate winnings using VALID pools only; share by valid amount (amount - lateAmount)
         uint256 winningPool = game.winningSide == Side.Red ? game.validRedPool : game.validBluePool;
-        uint256 userShare = (bet.amount * 1e18) / winningPool;
+        uint256 validAmount = bet.amount - bet.lateAmount;
+        uint256 userShare = (validAmount * 1e18) / winningPool;
         payout = (game.validLiquidity * userShare) / 1e18;
         
         bet.claimed = true;
