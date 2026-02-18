@@ -115,6 +115,7 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     error NothingToWithdraw();
     error InsufficientFeesForRefund();
     error InsufficientGameBalance();
+    error EmergencyWithdrawalsUsed();
 
     // ==================== IMMUTABLE CONSTANTS ====================
     // SECURITY NOTE: All values below are compile-time constants (using 'constant' keyword).
@@ -173,6 +174,9 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     mapping(uint256 => uint256) public gameFees;
     mapping(uint256 => mapping(address => bool)) public hasAnyBet;
     mapping(address => UserStats) public userStats;
+    
+    /// @dev If true, at least one user has emergency-withdrawn; resolve Phase 2 must not run (prevents accounting shortfall)
+    mapping(uint256 => bool) public emergencyWithdrawalsUsed;
     
     // Leaderboard
     address[] public leaderboard;
@@ -377,6 +381,8 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         if (game.phase == GamePhase.Calculating) {
             // betEntries only holds data for the current game; must resolve that game
             if (_gameId != currentGameId) revert GameNotFound();
+            // Once any user has emergency-withdrawn, valid pools would double-count their share (already paid out)
+            if (emergencyWithdrawalsUsed[_gameId]) revert EmergencyWithdrawalsUsed();
             // Try to get randomness from pre-committed drand round
             (bool pulseExists, bytes32 randomness) = _getDrandRandomness(game.targetDrandRound);
             
@@ -704,6 +710,9 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         uint256 redFee = redAmount > 0 ? (redAmount * PLATFORM_FEE) / FEE_DENOMINATOR : 0;
         uint256 blueFee = blueAmount > 0 ? (blueAmount * PLATFORM_FEE) / FEE_DENOMINATOR : 0;
         uint256 userFees = redFee + blueFee;
+        
+        // Mark that emergency withdrawals have been used for this game (resolve Phase 2 must not run after this)
+        emergencyWithdrawalsUsed[_gameId] = true;
         
         // Zero out bet structs BEFORE transfer (reentrancy protection)
         if (redAmount > 0) {
@@ -1174,7 +1183,7 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         actualEndBlock = game.actualEndBlock;
         canFinalize = false;
         
-        if (game.phase == GamePhase.Calculating && game.targetDrandRound > 0) {
+        if (game.phase == GamePhase.Calculating && game.targetDrandRound > 0 && !emergencyWithdrawalsUsed[_gameId]) {
             (bool pulseExists, ) = _getDrandRandomness(game.targetDrandRound);
             canFinalize = pulseExists;
         }
