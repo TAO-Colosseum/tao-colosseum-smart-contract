@@ -125,7 +125,6 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
     uint256 public constant PLATFORM_FEE = 150;              // 1.5% fee (immutable, cannot be changed)
     uint256 public constant FEE_DENOMINATOR = 10000;         // Fee basis points (immutable)
     uint256 public constant MIN_BET_AMOUNT = 0.001 ether;    // 0.001 TAO minimum
-    uint256 public constant MIN_TOTAL_BETS = 2;              // 2 bettors minimum
     uint256 public constant MIN_POOL_SIZE = 0.5 ether;       // 0.5 TAO minimum
     
     // Block-based durations (~12s/block on Bittensor EVM)
@@ -728,7 +727,9 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
         if (userFees > 0 && gameFees[_gameId] < userFees) {
             revert InsufficientFeesForRefund();
         }
-        gameBalance[_gameId] -= totalRefund;
+        uint256 netRefund = redNet + blueNet;
+        if (gameBalance[_gameId] < netRefund) revert InsufficientGameBalance();
+        gameBalance[_gameId] -= netRefund;
         if (userFees > 0) {
             gameFees[_gameId] -= userFees;
             totalRefund += userFees;
