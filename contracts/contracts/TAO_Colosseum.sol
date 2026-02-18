@@ -542,49 +542,51 @@ contract TAOColosseum is ReentrancyGuard, Ownable {
             revert GameNotResolved();
         }
         
-        // Handle LATE BETS - refund only the portion placed after cutoff
-        // _calculateValidPools() already moved late bet fees from gameFees into gameBalance
+        // Late portion: refund amount placed after cutoff (paid when isLateBet; for winning side we add winnings below)
         if (bet.isLateBet) {
             payout = bet.lateAmount;
-            if (gameBalance[_gameId] < payout) revert InsufficientGameBalance();
-            bet.claimed = true;
-            gameBalance[_gameId] -= payout;
-
-            (bool success, ) = payable(msg.sender).call{value: payout}("");
-            if (!success) revert TransferFailed();
-
-            emit LateBetRefunded(_gameId, msg.sender, _side, payout);
-            return;
         }
         
-        // Valid bet on losing side gets nothing
+        // Losing side: only late refund (if any), then done
         if (_side != game.winningSide) {
             bet.claimed = true;
+            if (payout > 0) {
+                if (gameBalance[_gameId] < payout) revert InsufficientGameBalance();
+                gameBalance[_gameId] -= payout;
+                (bool success, ) = payable(msg.sender).call{value: payout}("");
+                if (!success) revert TransferFailed();
+                emit LateBetRefunded(_gameId, msg.sender, _side, payout);
+            }
             userStats[msg.sender].totalLosses++;
             return;
         }
         
-        // Calculate winnings using VALID pools only; share by valid amount (amount - lateAmount)
+        // Winning side: add winnings (share of validLiquidity) to payout; one claim pays late refund + winnings
         uint256 winningPool = game.winningSide == Side.Red ? game.validRedPool : game.validBluePool;
         uint256 validAmount = bet.amount - bet.lateAmount;
-        uint256 userShare = (validAmount * 1e18) / winningPool;
-        payout = (game.validLiquidity * userShare) / 1e18;
+        uint256 winnings = 0;
+        if (winningPool > 0 && game.validLiquidity > 0) {
+            uint256 userShare = (validAmount * 1e18) / winningPool;
+            winnings = (game.validLiquidity * userShare) / 1e18;
+            payout += winnings;
+        }
         
         bet.claimed = true;
-        
         if (payout > 0) {
+            if (gameBalance[_gameId] < payout) revert InsufficientGameBalance();
             gameBalance[_gameId] -= payout;
-            
             (bool success, ) = payable(msg.sender).call{value: payout}("");
             if (!success) revert TransferFailed();
         }
-        
-        userStats[msg.sender].totalWins++;
-        userStats[msg.sender].totalWinnings += payout;
-        
-        _updateLeaderboard(msg.sender);
-        
-        emit WinningsClaimed(_gameId, msg.sender, _side, bet.amount, payout);
+        if (bet.isLateBet && bet.lateAmount > 0) {
+            emit LateBetRefunded(_gameId, msg.sender, _side, bet.lateAmount);
+        }
+        if (winnings > 0) {
+            userStats[msg.sender].totalWins++;
+            userStats[msg.sender].totalWinnings += winnings;
+            _updateLeaderboard(msg.sender);
+            emit WinningsClaimed(_gameId, msg.sender, _side, bet.amount, winnings);
+        }
     }
     
     function _cancelGame(uint256 _gameId, string memory _reason) internal {
