@@ -22,11 +22,13 @@ describe("RPS_Tournament", function () {
         }
     }
 
+    const SN38_HOTKEY_DUMMY = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
     beforeEach(async function () {
         signers = await ethers.getSigners();
         owner = signers[0];
         const RPS = await ethers.getContractFactory("RPS_Tournament");
-        rps = await RPS.deploy();
+        rps = await RPS.deploy(SN38_HOTKEY_DUMMY);
         await rps.waitForDeployment();
     });
 
@@ -60,11 +62,13 @@ describe("RPS_Tournament", function () {
     });
 
     describe("register", function () {
-        it("should allow registration with min entry", async function () {
+        it("should allow registration with min entry (fee deducted to accumulatedFees)", async function () {
             await rps.createTournament(4, 20, MIN_ENTRY);
             await expect(rps.connect(signers[1]).register(1, { value: MIN_ENTRY }))
                 .to.emit(rps, "PlayerRegistered").withArgs(1, signers[1].address, MIN_ENTRY);
-            expect((await rps.tournaments(1)).prizePool).to.equal(MIN_ENTRY);
+            const fee = (MIN_ENTRY * 150n) / 10000n;
+            expect((await rps.tournaments(1)).prizePool).to.equal(MIN_ENTRY - fee);
+            expect(await rps.accumulatedFees()).to.equal(fee);
         });
 
         it("should revert if already registered", async function () {
@@ -89,10 +93,12 @@ describe("RPS_Tournament", function () {
 
             expect(await rps.pendingWithdrawals(signers[1].address)).to.equal(MIN_ENTRY);
             expect((await rps.tournaments(1)).prizePool).to.equal(0);
+            expect(await rps.accumulatedFees()).to.equal(0);
 
             // can register again after unregister
             await rps.connect(signers[1]).register(1, { value: MIN_ENTRY });
-            expect((await rps.tournaments(1)).prizePool).to.equal(MIN_ENTRY);
+            const fee = (MIN_ENTRY * 150n) / 10000n;
+            expect((await rps.tournaments(1)).prizePool).to.equal(MIN_ENTRY - fee);
         });
 
         it("should revert unregister after registration ended", async function () {

@@ -29,10 +29,18 @@ async function main() {
   const balance = await hre.ethers.provider.getBalance(deployer.address);
   console.log("Balance:", hre.ethers.formatEther(balance), "TAO\n");
 
-  console.log("RPS uses hash commit-reveal; drand via storage precompile (same as TAO_Colosseum).\n");
+  console.log("RPS uses hash commit-reveal; drand via storage precompile (same as TAO_Colosseum).");
+  console.log("Fees (1.5%): flushed to sn38 owner hotkey then burned via staking precompile (not withdrawable).\n");
+
+  const sn38HotkeyHex = process.env.SN38_OWNER_HOTKEY;
+  if (!sn38HotkeyHex || !/^0x[0-9a-fA-F]{64}$/.test(sn38HotkeyHex)) {
+    console.error("SN38_OWNER_HOTKEY must be a 32-byte hex string (0x + 64 hex chars). Example: SN38_OWNER_HOTKEY=0x... npx hardhat run scripts/deploy-rps.js");
+    process.exit(1);
+  }
+  const sn38OwnerHotkeyBytes32 = sn38HotkeyHex;
 
   const RPS = await hre.ethers.getContractFactory("RPS_Tournament");
-  const deployTx = await RPS.getDeployTransaction();
+  const deployTx = await RPS.getDeployTransaction(sn38OwnerHotkeyBytes32);
 
   console.log("Estimating gas for RPS_Tournament...\n");
   let estimatedGas;
@@ -73,7 +81,7 @@ async function main() {
 
   console.log("\n🚀 Deploying RPS_Tournament...\n");
 
-  const rps = await RPS.deploy({
+  const rps = await RPS.deploy(sn38OwnerHotkeyBytes32, {
     gasLimit: gasLimitWithBuffer,
     gasPrice: gasPrice,
   });
@@ -97,6 +105,7 @@ async function main() {
   console.log("=========================================\n");
 
   console.log("MIN_ENTRY:", hre.ethers.formatEther(await rps.MIN_ENTRY()), "TAO");
+  console.log("sn38OwnerHotkey:", await rps.sn38OwnerHotkey());
   console.log("");
   console.log("DEPLOYED_RPS_ADDRESS=" + address);
 }

@@ -9,7 +9,8 @@ async function main() {
   const [deployer] = await hre.ethers.getSigners();
   console.log("Deployer:", deployer.address);
   const RPS = await hre.ethers.getContractFactory("RPS_Tournament");
-  const rps = await RPS.deploy();
+  const sn38Hotkey = hre.ethers.ZeroHash; // dummy for local; use real hotkey on main/testnet
+  const rps = await RPS.deploy(sn38Hotkey);
   await rps.waitForDeployment();
   const address = await rps.getAddress();
   console.log("RPS_Tournament deployed at:", address);
