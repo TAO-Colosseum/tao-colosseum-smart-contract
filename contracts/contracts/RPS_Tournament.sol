@@ -147,6 +147,7 @@ contract RPS_Tournament is ReentrancyGuard {
     error StakingOrBurnFailed();
     error InsufficientFeesForRefund();
     error InsufficientContractBalance();
+    error DrandStillAvailable();
 
     // ==================== STATE ====================
 
@@ -351,6 +352,29 @@ contract RPS_Tournament is ReentrancyGuard {
         address[] storage players = tournamentPlayers[_tournamentId];
         if (players.length >= 2) revert CannotCancel();
 
+        uint256 amt = tournamentConfig[_tournamentId].minEntry;
+        t.phase = TournamentPhase.Canceled;
+        for (uint256 i = 0; i < players.length; i++) {
+            _accrueWithdrawal(players[i], amt);
+        }
+        totalPrizeLiability -= t.prizePool;
+        t.prizePool = 0;
+        emit TournamentCanceled(_tournamentId);
+    }
+
+    /**
+     * @notice Escape hatch for tournaments stuck in Registration because drand is unavailable.
+     * @dev Callable only after registrationEnd + STALL_BLOCKS and only while drand remains unavailable.
+     * Refunds all registered players via pull-based withdrawals, regardless of player count.
+     */
+    function cancelUnstartableTournament(uint256 _tournamentId) external nonReentrant {
+        Tournament storage t = tournaments[_tournamentId];
+        if (t.id == 0) revert TournamentNotFound();
+        if (t.phase != TournamentPhase.Registration) revert NotRegistrationPhase();
+        if (block.number <= t.registrationEndBlock + STALL_BLOCKS) revert NotCancelableYet();
+        if (_isDrandAvailable()) revert DrandStillAvailable();
+
+        address[] storage players = tournamentPlayers[_tournamentId];
         uint256 amt = tournamentConfig[_tournamentId].minEntry;
         t.phase = TournamentPhase.Canceled;
         for (uint256 i = 0; i < players.length; i++) {
@@ -677,7 +701,8 @@ contract RPS_Tournament is ReentrancyGuard {
      * Uses staking precompile 0x0805: addStake(hotkey, amount, 38) then burnAlpha(hotkey, alphaReceived, 38).
      */
     function flushFeesToSubnetAndBurn() external nonReentrant {
-        uint256 amountWei = accumulatedFees;
+        uint256 prevFees = accumulatedFees;
+        uint256 amountWei = prevFees;
         if (amountWei == 0) return;
 
         uint256 liabilities = totalPrizeLiability + totalPendingWithdrawalLiability;
@@ -696,7 +721,7 @@ contract RPS_Tournament is ReentrancyGuard {
         // addStake(amount) expects amount in RAO (1e9 per TAO), not wei.
         staking.addStake(sn38OwnerHotkey, amountRao, NETUID_SN38);
         // Keep sub-rao dust in accumulatedFees (cannot be staked until it reaches 1 RAO).
-        accumulatedFees = amountWei - spentWei;
+        accumulatedFees = prevFees - spentWei;
 
         uint256 alphaAfter = staking.getTotalAlphaStaked(sn38OwnerHotkey, NETUID_SN38);
         uint256 alphaReceived = alphaAfter > alphaBefore ? alphaAfter - alphaBefore : 0;
@@ -767,6 +792,13 @@ contract RPS_Tournament is ReentrancyGuard {
         bytes32 rand;
         assembly ("memory-safe") { rand := mload(add(add(storageData, 32), randomnessStart)) }
         return (true, rand);
+    }
+
+    function _isDrandAvailable() internal view returns (bool) {
+        uint64 lastRound = _getLastStoredRound();
+        if (lastRound == 0) return false;
+        (bool hasRandomness,) = _getDrandRandomness(lastRound);
+        return hasRandomness;
     }
 
     function _blake2b128(bytes memory data) internal pure returns (bytes16 hash) {

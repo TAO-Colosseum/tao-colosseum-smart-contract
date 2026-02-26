@@ -109,7 +109,7 @@ describe("RPS_Tournament", function () {
         });
 
         it("should revert unregister after registration ended", async function () {
-            await rps.createTournament(4, 2, MIN_ENTRY);
+            await rps.createTournament(4, 10, MIN_ENTRY);
             await rps.connect(signers[1]).register(1, { value: MIN_ENTRY });
             const t = await rps.tournaments(1);
             await mineTo(Number(t.registrationEndBlock));
@@ -120,7 +120,7 @@ describe("RPS_Tournament", function () {
 
     describe("cancelTournament", function () {
         it("should cancel and refund when time passed and < 2 players", async function () {
-            await rps.createTournament(4, 2, MIN_ENTRY);
+            await rps.createTournament(4, 10, MIN_ENTRY);
             await rps.connect(signers[1]).register(1, { value: MIN_ENTRY });
             const t = await rps.tournaments(1);
             await mineTo(Number(t.registrationEndBlock));
@@ -151,6 +151,50 @@ describe("RPS_Tournament", function () {
             await rps.createTournament(4, 20, MIN_ENTRY);
             for (let i = 1; i <= 4; i++) await rps.connect(signers[i]).register(1, { value: MIN_ENTRY });
             await expect(rps.startTournament(1)).to.be.revertedWithCustomError(rps, "DrandUnavailable");
+        });
+
+        it("should allow registration-phase escape hatch after timeout when drand is unavailable", async function () {
+            await rps.createTournament(4, 10, MIN_ENTRY);
+            await rps.connect(signers[1]).register(1, { value: MIN_ENTRY });
+            await rps.connect(signers[2]).register(1, { value: MIN_ENTRY });
+
+            const t = await rps.tournaments(1);
+            const stallBlocks = await rps.STALL_BLOCKS();
+            await mineTo(Number(t.registrationEndBlock + stallBlocks + 1n));
+
+            await expect(rps.cancelUnstartableTournament(1))
+                .to.emit(rps, "TournamentCanceled")
+                .withArgs(1);
+
+            expect(await rps.pendingWithdrawals(signers[1].address)).to.equal(MIN_ENTRY);
+            expect(await rps.pendingWithdrawals(signers[2].address)).to.equal(MIN_ENTRY);
+            expect((await rps.tournaments(1)).phase).to.equal(2); // Canceled
+        });
+
+        it("should revert registration-phase escape hatch before timeout", async function () {
+            await rps.createTournament(4, 10, MIN_ENTRY);
+            await rps.connect(signers[1]).register(1, { value: MIN_ENTRY });
+            await rps.connect(signers[2]).register(1, { value: MIN_ENTRY });
+
+            const t = await rps.tournaments(1);
+            await mineTo(Number(t.registrationEndBlock + 1n));
+
+            await expect(rps.cancelUnstartableTournament(1))
+                .to.be.revertedWithCustomError(rps, "NotCancelableYet");
+        });
+
+        it("should revert registration-phase escape hatch when drand is available", async function () {
+            await installMockDrandPrecompile();
+            await rps.createTournament(4, 10, MIN_ENTRY);
+            await rps.connect(signers[1]).register(1, { value: MIN_ENTRY });
+            await rps.connect(signers[2]).register(1, { value: MIN_ENTRY });
+
+            const t = await rps.tournaments(1);
+            const stallBlocks = await rps.STALL_BLOCKS();
+            await mineTo(Number(t.registrationEndBlock + stallBlocks + 1n));
+
+            await expect(rps.cancelUnstartableTournament(1))
+                .to.be.revertedWithCustomError(rps, "DrandStillAvailable");
         });
     });
 
@@ -377,6 +421,39 @@ describe("RPS_Tournament", function () {
             expect((await rps.tournaments(1)).prizePool).to.equal(0);
             expect(await rps.totalPrizeLiability()).to.equal(0);
             expect(await rps.accumulatedFees()).to.equal(0);
+        });
+
+        it("should preserve unflushed fee remainder when free balance is temporarily constrained", async function () {
+            await installMockDrandPrecompile();
+            await installMockStakingPrecompile();
+
+            await rps.createTournament(4, 10, MIN_ENTRY);
+            await rps.connect(signers[1]).register(1, { value: MIN_ENTRY });
+            await rps.connect(signers[2]).register(1, { value: MIN_ENTRY });
+
+            const reg = await rps.tournaments(1);
+            await mineTo(Number(reg.registrationEndBlock));
+            await rps.startTournament(1);
+
+            const match = await rps.matches(1, 0, 0);
+            await mineTo(Number(match.revealEndBlock) + 1);
+            await rps.tryRevealMatch(1, 0, 0);
+
+            const completed = await rps.tournaments(1);
+            const winnerSigner = signers.find((s) => s.address === completed.winner);
+            await rps.connect(winnerSigner).claimPrize(1);
+
+            const feesBeforeFlush = await rps.accumulatedFees();
+            expect(feesBeforeFlush).to.be.gt(0);
+
+            // Force a lower free balance to exercise partial-flush bookkeeping path.
+            const constrainedFreeBalance = 3n * 10n ** 9n; // 3 RAO, exact multiple of WEI_PER_RAO
+            await ethers.provider.send("hardhat_setBalance", [rps.target, ethers.toBeHex(constrainedFreeBalance)]);
+
+            await rps.flushFeesToSubnetAndBurn();
+
+            const feesAfterFlush = await rps.accumulatedFees();
+            expect(feesAfterFlush).to.equal(feesBeforeFlush - constrainedFreeBalance);
         });
     });
 
