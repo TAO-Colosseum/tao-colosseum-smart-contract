@@ -3,6 +3,13 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
+/// Minimal interface for Subtensor staking precompile (0x0805) – addStake to sn38, then burn alpha.
+interface IStakingV2 {
+    function addStake(bytes32 hotkey, uint256 amount, uint256 netuid) external payable;
+    function getTotalAlphaStaked(bytes32 hotkey, uint256 netuid) external view returns (uint256);
+    function burnAlpha(bytes32 hotkey, uint256 amount, uint256 netuid) external payable;
+}
+
 /**
  * @title RPS_Tournament
  * @notice Single-elimination Rock-Paper-Scissors tournament on Bittensor EVM.
@@ -85,6 +92,14 @@ contract RPS_Tournament is ReentrancyGuard {
     // Drand precompile (subtensor PR #2445): 0x080e = 2062
     address public constant DRAND_PRECOMPILE  = 0x000000000000000000000000000000000000080e;
 
+    // Fee: 1.5% of the prize pool; not withdrawable – flushed to sn38 stake + burn via precompile
+    uint256 public constant PLATFORM_FEE = 150;       // 1.5% in basis points
+    uint256 public constant FEE_DENOMINATOR = 10000;
+
+    // Staking precompile: buy sn38 alpha to hotkey, then burn (0x0805)
+    address public constant STAKING_PRECOMPILE = 0x0000000000000000000000000000000000000805;
+    uint256 public constant NETUID_SN38 = 38;
+
     bytes public constant DRAND_PULSES_PREFIX = hex"a285cdb66e8b8524ea70b1693c7b1e050d8e70fd32bfb1639703f9a23d15b15e";
     bytes32 public constant DRAND_LAST_ROUND_KEY = 0xa285cdb66e8b8524ea70b1693c7b1e05087f3dd6e0ceded0e388dd34f810a73d;
 
@@ -126,10 +141,18 @@ contract RPS_Tournament is ReentrancyGuard {
     error NotRegistered();
     error DirectETHNotAccepted();
     error SeedRoundAlreadyKnown();
+    error StakingOrBurnFailed();
+    error InsufficientFeesForRefund();
 
     // ==================== STATE ====================
 
     uint256 public nextTournamentId = 1;
+
+    /// Sn38 owner hotkey: fees are staked here (as alpha) then burned. Set at deploy.
+    bytes32 public immutable sn38OwnerHotkey;
+
+    /// Platform fees from entries; flushed to sn38 via addStake + burn (not owner-withdrawable).
+    uint256 public accumulatedFees;
 
     mapping(uint256 => Tournament) public tournaments;
     mapping(uint256 => TournamentConfig) public tournamentConfig;
@@ -161,10 +184,14 @@ contract RPS_Tournament is ReentrancyGuard {
     event TournamentCompleted(uint256 indexed tournamentId, address winner);
     event PrizeClaimed(uint256 indexed tournamentId, address winner, uint256 amount);
     event WithdrawalAccrued(address indexed to, uint256 amount);
+    event FeesFlushedToSn38AndBurned(uint256 taoAmount, uint256 alphaBurned);
 
     // ==================== CONSTRUCTOR ====================
 
-    constructor() {}
+    /// @param _sn38OwnerHotkey Hotkey (32 bytes) of subnet 38 owner; fees buy alpha to this key then burn.
+    constructor(bytes32 _sn38OwnerHotkey) {
+        sn38OwnerHotkey = _sn38OwnerHotkey;
+    }
 
     // ==================== PHASE 2: LIFECYCLE ====================
 
@@ -250,8 +277,12 @@ contract RPS_Tournament is ReentrancyGuard {
         // enforce exact entry to guarantee consistent refunds and avoid trapping excess funds
         if (msg.value != tournamentConfig[_tournamentId].minEntry) revert InsufficientOrExcessEntry();
 
+        uint256 feeAmount = (msg.value * PLATFORM_FEE) / FEE_DENOMINATOR;
+        uint256 netAmount = msg.value - feeAmount;
+
         players.push(msg.sender);
-        t.prizePool += msg.value;
+        t.prizePool += netAmount;
+        accumulatedFees += feeAmount;
         emit PlayerRegistered(_tournamentId, msg.sender, msg.value);
     }
 
@@ -272,15 +303,20 @@ contract RPS_Tournament is ReentrancyGuard {
         }
         if (idx == type(uint256).max) revert NotRegistered();
 
+        uint256 amt = tournamentConfig[_tournamentId].minEntry;
+        uint256 feeAmount = (amt * PLATFORM_FEE) / FEE_DENOMINATOR;
+        uint256 netAmount = amt - feeAmount;
+
         // swap-pop
         uint256 last = players.length - 1;
         if (idx != last) players[idx] = players[last];
         players.pop();
 
-        uint256 amt = tournamentConfig[_tournamentId].minEntry;
+        if (accumulatedFees < feeAmount) revert InsufficientFeesForRefund();
+        accumulatedFees -= feeAmount;
+        t.prizePool -= netAmount;
         pendingWithdrawals[msg.sender] += amt;
         emit WithdrawalAccrued(msg.sender, amt);
-        t.prizePool -= amt;
     }
 
     /**
@@ -314,9 +350,14 @@ contract RPS_Tournament is ReentrancyGuard {
         address[] storage players = tournamentPlayers[_tournamentId];
         if (players.length >= 2) revert CannotCancel();
 
+        uint256 amt = tournamentConfig[_tournamentId].minEntry;
+        uint256 feeAmount = (amt * PLATFORM_FEE) / FEE_DENOMINATOR;
+        uint256 refundFees = players.length * feeAmount;
+        if (accumulatedFees < refundFees) revert InsufficientFeesForRefund();
+        accumulatedFees -= refundFees;
+
         t.phase = TournamentPhase.Canceled;
         for (uint256 i = 0; i < players.length; i++) {
-            uint256 amt = tournamentConfig[_tournamentId].minEntry;
             pendingWithdrawals[players[i]] += amt;
             emit WithdrawalAccrued(players[i], amt);
         }
@@ -607,10 +648,14 @@ contract RPS_Tournament is ReentrancyGuard {
         if (t.phase != TournamentPhase.Active) revert NotActive();
         if (block.number <= t.roundStartBlock + STALL_BLOCKS) revert NotCancelableYet();
 
-        t.phase = TournamentPhase.Canceled;
-
         address[] storage players = tournamentPlayers[_tournamentId];
         uint256 amt = tournamentConfig[_tournamentId].minEntry;
+        uint256 feeAmount = (amt * PLATFORM_FEE) / FEE_DENOMINATOR;
+        uint256 refundFees = players.length * feeAmount;
+        if (accumulatedFees < refundFees) revert InsufficientFeesForRefund();
+        accumulatedFees -= refundFees;
+
+        t.phase = TournamentPhase.Canceled;
         for (uint256 i = 0; i < players.length; i++) {
             pendingWithdrawals[players[i]] += amt;
             emit WithdrawalAccrued(players[i], amt);
@@ -628,6 +673,29 @@ contract RPS_Tournament is ReentrancyGuard {
         pendingWithdrawals[msg.sender] = 0;
         (bool ok,) = msg.sender.call{ value: amt }("");
         if (!ok) revert TransferFailed();
+    }
+
+    /**
+     * @notice Flush accumulated platform fees: buy subnet 38 alpha (stake TAO to sn38 owner hotkey) then burn.
+     * @dev Permissionless. Not withdrawable by owner – fees only leave the contract via this path.
+     * Uses staking precompile 0x0805: addStake(hotkey, amount, 38) then burnAlpha(hotkey, alphaReceived, 38).
+     */
+    function flushFeesToSubnetAndBurn() external nonReentrant {
+        uint256 amount = accumulatedFees;
+        if (amount == 0) return;
+
+        IStakingV2 staking = IStakingV2(STAKING_PRECOMPILE);
+        uint256 alphaBefore = staking.getTotalAlphaStaked(sn38OwnerHotkey, NETUID_SN38);
+
+        staking.addStake{ value: amount }(sn38OwnerHotkey, amount, NETUID_SN38);
+        accumulatedFees = 0;
+
+        uint256 alphaAfter = staking.getTotalAlphaStaked(sn38OwnerHotkey, NETUID_SN38);
+        uint256 alphaReceived = alphaAfter > alphaBefore ? alphaAfter - alphaBefore : 0;
+        if (alphaReceived > 0) {
+            staking.burnAlpha(sn38OwnerHotkey, alphaReceived, NETUID_SN38);
+            emit FeesFlushedToSn38AndBurned(amount, alphaReceived);
+        }
     }
 
     // ==================== DRAND HELPERS ====================
