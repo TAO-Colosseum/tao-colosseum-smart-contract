@@ -7,6 +7,7 @@ describe("RPS_Tournament", function () {
     let signers;
     const MIN_ENTRY = ethers.parseEther("0.5");
     const DRAND_PRECOMPILE = "0x000000000000000000000000000000000000080E";
+    const STAKING_PRECOMPILE = "0x0000000000000000000000000000000000000805";
 
     async function installMockDrandPrecompile() {
         const Mock = await ethers.getContractFactory("MockDrandPrecompile");
@@ -14,6 +15,14 @@ describe("RPS_Tournament", function () {
         await mock.waitForDeployment();
         const runtimeCode = await ethers.provider.getCode(mock.target);
         await ethers.provider.send("hardhat_setCode", [DRAND_PRECOMPILE, runtimeCode]);
+    }
+
+    async function installMockStakingPrecompile() {
+        const Mock = await ethers.getContractFactory("MockStakingPrecompile");
+        const mock = await Mock.deploy();
+        await mock.waitForDeployment();
+        const runtimeCode = await ethers.provider.getCode(mock.target);
+        await ethers.provider.send("hardhat_setCode", [STAKING_PRECOMPILE, runtimeCode]);
     }
 
     async function mineTo(targetBlock) {
@@ -62,13 +71,12 @@ describe("RPS_Tournament", function () {
     });
 
     describe("register", function () {
-        it("should allow registration with min entry (fee deducted to accumulatedFees)", async function () {
+        it("should keep full entry in prizePool until tournament settlement", async function () {
             await rps.createTournament(4, 20, MIN_ENTRY);
             await expect(rps.connect(signers[1]).register(1, { value: MIN_ENTRY }))
                 .to.emit(rps, "PlayerRegistered").withArgs(1, signers[1].address, MIN_ENTRY);
-            const fee = (MIN_ENTRY * 150n) / 10000n;
-            expect((await rps.tournaments(1)).prizePool).to.equal(MIN_ENTRY - fee);
-            expect(await rps.accumulatedFees()).to.equal(fee);
+            expect((await rps.tournaments(1)).prizePool).to.equal(MIN_ENTRY);
+            expect(await rps.accumulatedFees()).to.equal(0);
         });
 
         it("should revert if already registered", async function () {
@@ -97,8 +105,7 @@ describe("RPS_Tournament", function () {
 
             // can register again after unregister
             await rps.connect(signers[1]).register(1, { value: MIN_ENTRY });
-            const fee = (MIN_ENTRY * 150n) / 10000n;
-            expect((await rps.tournaments(1)).prizePool).to.equal(MIN_ENTRY - fee);
+            expect((await rps.tournaments(1)).prizePool).to.equal(MIN_ENTRY);
         });
 
         it("should revert unregister after registration ended", async function () {
@@ -278,6 +285,98 @@ describe("RPS_Tournament", function () {
             await expect(rps.tryRevealMatch(1, 0, 0)).to.emit(rps, "MatchResolved");
             m = await rps.matches(1, 0, 0);
             expect(m.winner).to.not.equal(ethers.ZeroAddress);
+        });
+    });
+
+    describe("fee accounting safety", function () {
+        it("should allow full unregister refund even if flush is attempted during registration", async function () {
+            await installMockStakingPrecompile();
+            await rps.createTournament(4, 20, MIN_ENTRY);
+            await rps.connect(signers[1]).register(1, { value: MIN_ENTRY });
+
+            // No fees exist before tournament settlement; flush should be a no-op.
+            await expect(rps.flushFeesToSubnetAndBurn()).to.not.be.reverted;
+            expect(await rps.accumulatedFees()).to.equal(0);
+
+            await expect(rps.connect(signers[1]).unregister(1))
+                .to.emit(rps, "WithdrawalAccrued")
+                .withArgs(signers[1].address, MIN_ENTRY);
+
+            expect(await rps.pendingWithdrawals(signers[1].address)).to.equal(MIN_ENTRY);
+            expect((await rps.tournaments(1)).prizePool).to.equal(0);
+            expect(await rps.totalPrizeLiability()).to.equal(0);
+        });
+
+        it("should split fee exactly at claim time and keep dust in winner payout", async function () {
+            await installMockDrandPrecompile();
+            await installMockStakingPrecompile();
+
+            const oddEntry = MIN_ENTRY + 1n; // force odd-wei total pot for deterministic floor division behavior
+            await rps.createTournament(4, 10, oddEntry);
+            await rps.connect(signers[1]).register(1, { value: oddEntry });
+            await rps.connect(signers[2]).register(1, { value: oddEntry });
+
+            const reg = await rps.tournaments(1);
+            await mineTo(Number(reg.registrationEndBlock));
+            await rps.startTournament(1);
+
+            // Resolve the only match by no-show path (both uncommitted => drand tiebreak winner).
+            const match = await rps.matches(1, 0, 0);
+            await mineTo(Number(match.revealEndBlock) + 1);
+            await rps.tryRevealMatch(1, 0, 0);
+
+            const tBeforeClaim = await rps.tournaments(1);
+            expect(tBeforeClaim.phase).to.equal(3); // Completed
+            expect(await rps.accumulatedFees()).to.equal(0);
+
+            const totalPot = oddEntry * 2n;
+            expect(tBeforeClaim.prizePool).to.equal(totalPot);
+
+            const expectedFee = (totalPot * 150n) / 10000n;
+            const expectedPayout = totalPot - expectedFee;
+            const winner = tBeforeClaim.winner;
+            const winnerSigner = signers.find((s) => s.address === winner);
+            expect(winnerSigner).to.not.equal(undefined);
+
+            await expect(rps.connect(winnerSigner).claimPrize(1))
+                .to.emit(rps, "PrizeClaimed")
+                .withArgs(1, winner, expectedPayout);
+
+            const tAfterClaim = await rps.tournaments(1);
+            expect(tAfterClaim.prizePool).to.equal(0);
+            expect(await rps.totalPrizeLiability()).to.equal(0);
+            expect(await rps.accumulatedFees()).to.equal(expectedFee);
+        });
+
+        it("should allow stalled cancel refunds after a flush attempt", async function () {
+            await installMockDrandPrecompile();
+            await installMockStakingPrecompile();
+
+            await rps.createTournament(4, 10, MIN_ENTRY);
+            await rps.connect(signers[1]).register(1, { value: MIN_ENTRY });
+            await rps.connect(signers[2]).register(1, { value: MIN_ENTRY });
+
+            const reg = await rps.tournaments(1);
+            await mineTo(Number(reg.registrationEndBlock));
+            await rps.startTournament(1);
+
+            // Fees are only collected at claim time, so this remains a safe no-op.
+            await expect(rps.flushFeesToSubnetAndBurn()).to.not.be.reverted;
+            expect(await rps.accumulatedFees()).to.equal(0);
+
+            const stalled = await rps.tournaments(1);
+            const stallBlocks = await rps.STALL_BLOCKS();
+            await mineTo(Number(stalled.roundStartBlock + stallBlocks + 1n));
+
+            await expect(rps.cancelStalledTournament(1))
+                .to.emit(rps, "TournamentCanceled")
+                .withArgs(1);
+
+            expect(await rps.pendingWithdrawals(signers[1].address)).to.equal(MIN_ENTRY);
+            expect(await rps.pendingWithdrawals(signers[2].address)).to.equal(MIN_ENTRY);
+            expect((await rps.tournaments(1)).prizePool).to.equal(0);
+            expect(await rps.totalPrizeLiability()).to.equal(0);
+            expect(await rps.accumulatedFees()).to.equal(0);
         });
     });
 
