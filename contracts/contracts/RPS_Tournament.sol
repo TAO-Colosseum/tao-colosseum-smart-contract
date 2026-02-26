@@ -99,6 +99,8 @@ contract RPS_Tournament is ReentrancyGuard {
     // Staking precompile: buy sn38 alpha to hotkey, then burn (0x0805)
     address public constant STAKING_PRECOMPILE = 0x0000000000000000000000000000000000000805;
     uint256 public constant NETUID_SN38 = 38;
+    // Unit conversion: EVM native uses 1e18 per TAO, staking precompile expects RAO (1e9 per TAO).
+    uint256 public constant WEI_PER_RAO = 1e9;
 
     bytes public constant DRAND_PULSES_PREFIX = hex"a285cdb66e8b8524ea70b1693c7b1e050d8e70fd32bfb1639703f9a23d15b15e";
     bytes32 public constant DRAND_LAST_ROUND_KEY = 0xa285cdb66e8b8524ea70b1693c7b1e05087f3dd6e0ceded0e388dd34f810a73d;
@@ -143,6 +145,7 @@ contract RPS_Tournament is ReentrancyGuard {
     error SeedRoundAlreadyKnown();
     error StakingOrBurnFailed();
     error InsufficientFeesForRefund();
+    error InsufficientContractBalance();
 
     // ==================== STATE ====================
 
@@ -681,20 +684,27 @@ contract RPS_Tournament is ReentrancyGuard {
      * Uses staking precompile 0x0805: addStake(hotkey, amount, 38) then burnAlpha(hotkey, alphaReceived, 38).
      */
     function flushFeesToSubnetAndBurn() external nonReentrant {
-        uint256 amount = accumulatedFees;
-        if (amount == 0) return;
+        uint256 amountWei = accumulatedFees;
+        if (amountWei == 0) return;
+
+        uint256 amountRao = amountWei / WEI_PER_RAO;
+        if (amountRao == 0) return;
+        uint256 spentWei = amountRao * WEI_PER_RAO;
+        if (address(this).balance < spentWei) revert InsufficientContractBalance();
 
         IStakingV2 staking = IStakingV2(STAKING_PRECOMPILE);
         uint256 alphaBefore = staking.getTotalAlphaStaked(sn38OwnerHotkey, NETUID_SN38);
 
-        staking.addStake{ value: amount }(sn38OwnerHotkey, amount, NETUID_SN38);
-        accumulatedFees = 0;
+        // addStake(amount) expects amount in RAO (1e9 per TAO), not wei.
+        staking.addStake(sn38OwnerHotkey, amountRao, NETUID_SN38);
+        // Keep sub-rao dust in accumulatedFees (cannot be staked until it reaches 1 RAO).
+        accumulatedFees = amountWei - spentWei;
 
         uint256 alphaAfter = staking.getTotalAlphaStaked(sn38OwnerHotkey, NETUID_SN38);
         uint256 alphaReceived = alphaAfter > alphaBefore ? alphaAfter - alphaBefore : 0;
         if (alphaReceived > 0) {
             staking.burnAlpha(sn38OwnerHotkey, alphaReceived, NETUID_SN38);
-            emit FeesFlushedToSn38AndBurned(amount, alphaReceived);
+            emit FeesFlushedToSn38AndBurned(spentWei, alphaReceived);
         }
     }
 
