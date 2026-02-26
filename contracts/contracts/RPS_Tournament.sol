@@ -92,7 +92,8 @@ contract RPS_Tournament is ReentrancyGuard {
     // Drand precompile (subtensor PR #2445): 0x080e = 2062
     address public constant DRAND_PRECOMPILE  = 0x000000000000000000000000000000000000080e;
 
-    // Fee: 1.5% of the prize pool; not withdrawable – flushed to sn38 stake + burn via precompile
+    // Fee: 1.5% of the final tournament pot; collected at prize claim time and
+    // not withdrawable – flushed to sn38 stake + burn via precompile.
     uint256 public constant PLATFORM_FEE = 150;       // 1.5% in basis points
     uint256 public constant FEE_DENOMINATOR = 10000;
 
@@ -154,8 +155,12 @@ contract RPS_Tournament is ReentrancyGuard {
     /// Sn38 owner hotkey: fees are staked here (as alpha) then burned. Set at deploy.
     bytes32 public immutable sn38OwnerHotkey;
 
-    /// Platform fees from entries; flushed to sn38 via addStake + burn (not owner-withdrawable).
+    /// Platform fees from settled tournaments; flushed to sn38 via addStake + burn (not owner-withdrawable).
     uint256 public accumulatedFees;
+    /// Aggregate amount currently owed as tournament prizes across all tournaments.
+    uint256 public totalPrizeLiability;
+    /// Aggregate amount currently owed in pull-based withdrawals.
+    uint256 public totalPendingWithdrawalLiability;
 
     mapping(uint256 => Tournament) public tournaments;
     mapping(uint256 => TournamentConfig) public tournamentConfig;
@@ -280,12 +285,10 @@ contract RPS_Tournament is ReentrancyGuard {
         // enforce exact entry to guarantee consistent refunds and avoid trapping excess funds
         if (msg.value != tournamentConfig[_tournamentId].minEntry) revert InsufficientOrExcessEntry();
 
-        uint256 feeAmount = (msg.value * PLATFORM_FEE) / FEE_DENOMINATOR;
-        uint256 netAmount = msg.value - feeAmount;
-
         players.push(msg.sender);
-        t.prizePool += netAmount;
-        accumulatedFees += feeAmount;
+        // Keep entries fully refundable until tournament completion/claim.
+        t.prizePool += msg.value;
+        totalPrizeLiability += msg.value;
         emit PlayerRegistered(_tournamentId, msg.sender, msg.value);
     }
 
@@ -307,19 +310,14 @@ contract RPS_Tournament is ReentrancyGuard {
         if (idx == type(uint256).max) revert NotRegistered();
 
         uint256 amt = tournamentConfig[_tournamentId].minEntry;
-        uint256 feeAmount = (amt * PLATFORM_FEE) / FEE_DENOMINATOR;
-        uint256 netAmount = amt - feeAmount;
-
         // swap-pop
         uint256 last = players.length - 1;
         if (idx != last) players[idx] = players[last];
         players.pop();
 
-        if (accumulatedFees < feeAmount) revert InsufficientFeesForRefund();
-        accumulatedFees -= feeAmount;
-        t.prizePool -= netAmount;
-        pendingWithdrawals[msg.sender] += amt;
-        emit WithdrawalAccrued(msg.sender, amt);
+        t.prizePool -= amt;
+        totalPrizeLiability -= amt;
+        _accrueWithdrawal(msg.sender, amt);
     }
 
     /**
@@ -354,16 +352,11 @@ contract RPS_Tournament is ReentrancyGuard {
         if (players.length >= 2) revert CannotCancel();
 
         uint256 amt = tournamentConfig[_tournamentId].minEntry;
-        uint256 feeAmount = (amt * PLATFORM_FEE) / FEE_DENOMINATOR;
-        uint256 refundFees = players.length * feeAmount;
-        if (accumulatedFees < refundFees) revert InsufficientFeesForRefund();
-        accumulatedFees -= refundFees;
-
         t.phase = TournamentPhase.Canceled;
         for (uint256 i = 0; i < players.length; i++) {
-            pendingWithdrawals[players[i]] += amt;
-            emit WithdrawalAccrued(players[i], amt);
+            _accrueWithdrawal(players[i], amt);
         }
+        totalPrizeLiability -= t.prizePool;
         t.prizePool = 0;
         emit TournamentCanceled(_tournamentId);
     }
@@ -634,10 +627,14 @@ contract RPS_Tournament is ReentrancyGuard {
         if (t.prizeClaimed) revert PrizeAlreadyClaimed();
         t.prizeClaimed = true;
         uint256 amount = t.prizePool;
+        uint256 feeAmount = (amount * PLATFORM_FEE) / FEE_DENOMINATOR;
+        uint256 payoutAmount = amount - feeAmount;
         t.prizePool = 0;
-        (bool ok,) = msg.sender.call{ value: amount }("");
+        totalPrizeLiability -= amount;
+        accumulatedFees += feeAmount;
+        (bool ok,) = msg.sender.call{ value: payoutAmount }("");
         if (!ok) revert TransferFailed();
-        emit PrizeClaimed(_tournamentId, msg.sender, amount);
+        emit PrizeClaimed(_tournamentId, msg.sender, payoutAmount);
     }
 
     /**
@@ -653,16 +650,11 @@ contract RPS_Tournament is ReentrancyGuard {
 
         address[] storage players = tournamentPlayers[_tournamentId];
         uint256 amt = tournamentConfig[_tournamentId].minEntry;
-        uint256 feeAmount = (amt * PLATFORM_FEE) / FEE_DENOMINATOR;
-        uint256 refundFees = players.length * feeAmount;
-        if (accumulatedFees < refundFees) revert InsufficientFeesForRefund();
-        accumulatedFees -= refundFees;
-
         t.phase = TournamentPhase.Canceled;
         for (uint256 i = 0; i < players.length; i++) {
-            pendingWithdrawals[players[i]] += amt;
-            emit WithdrawalAccrued(players[i], amt);
+            _accrueWithdrawal(players[i], amt);
         }
+        totalPrizeLiability -= t.prizePool;
         t.prizePool = 0;
         emit TournamentCanceled(_tournamentId);
     }
@@ -674,6 +666,7 @@ contract RPS_Tournament is ReentrancyGuard {
         uint256 amt = pendingWithdrawals[msg.sender];
         if (amt == 0) return;
         pendingWithdrawals[msg.sender] = 0;
+        totalPendingWithdrawalLiability -= amt;
         (bool ok,) = msg.sender.call{ value: amt }("");
         if (!ok) revert TransferFailed();
     }
@@ -687,10 +680,15 @@ contract RPS_Tournament is ReentrancyGuard {
         uint256 amountWei = accumulatedFees;
         if (amountWei == 0) return;
 
+        uint256 liabilities = totalPrizeLiability + totalPendingWithdrawalLiability;
+        if (address(this).balance <= liabilities) return;
+        uint256 freeBalance = address(this).balance - liabilities;
+        if (freeBalance < amountWei) amountWei = freeBalance;
+        if (amountWei == 0) return;
+
         uint256 amountRao = amountWei / WEI_PER_RAO;
         if (amountRao == 0) return;
         uint256 spentWei = amountRao * WEI_PER_RAO;
-        if (address(this).balance < spentWei) revert InsufficientContractBalance();
 
         IStakingV2 staking = IStakingV2(STAKING_PRECOMPILE);
         uint256 alphaBefore = staking.getTotalAlphaStaked(sn38OwnerHotkey, NETUID_SN38);
@@ -706,6 +704,12 @@ contract RPS_Tournament is ReentrancyGuard {
             staking.burnAlpha(sn38OwnerHotkey, alphaReceived, NETUID_SN38);
             emit FeesFlushedToSn38AndBurned(spentWei, alphaReceived);
         }
+    }
+
+    function _accrueWithdrawal(address to, uint256 amt) internal {
+        pendingWithdrawals[to] += amt;
+        totalPendingWithdrawalLiability += amt;
+        emit WithdrawalAccrued(to, amt);
     }
 
     // ==================== DRAND HELPERS ====================
