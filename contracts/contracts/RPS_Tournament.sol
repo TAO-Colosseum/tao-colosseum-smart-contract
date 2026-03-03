@@ -69,6 +69,7 @@ contract RPS_Tournament is ReentrancyGuard {
         uint256 revealEndBlock;
         uint8 rpsRound; // 0..maxRPSRoundsPerMatch-1
         uint64 seedRound; // drand round selected for tie/no-show of the CURRENT rpsRound
+        bool seedCompromised; // set when seedRound was already known during commit; refreshed before drand tiebreak
         address winner; // set when resolved
     }
 
@@ -83,9 +84,12 @@ contract RPS_Tournament is ReentrancyGuard {
     uint256 public constant REVEAL_BLOCKS = 10;
     uint8 public constant MAX_RPS_ROUNDS_PER_MATCH = 3;
 
-    // Fixed buffer: match ties/no-shows resolve using randomness from a future drand round.
-    // Must be large enough that the pulse is very likely available by the time resolution is attempted.
+    // Base buffer: match ties/no-shows resolve using randomness from a future drand round.
+    // Additional offset is derived from commit window size via DRAND_ROUNDS_PER_BLOCK_ESTIMATE.
     uint64 public constant SEED_ROUND_BUFFER_ROUNDS = 20;
+    // Conservative estimate to keep seed unknown throughout commit window.
+    // Finney blocks are ~12s while drand pulses are much faster; use high-side safety.
+    uint64 public constant DRAND_ROUNDS_PER_BLOCK_ESTIMATE = 8;
 
     // Drand via storage precompile (same as TAO_Colosseum): 0x0807 = StorageQuery, fallback for pulses
     address public constant STORAGE_PRECOMPILE = 0x0000000000000000000000000000000000000807;
@@ -143,7 +147,6 @@ contract RPS_Tournament is ReentrancyGuard {
     error RevealPhaseNotEnded();
     error NotRegistered();
     error DirectETHNotAccepted();
-    error SeedRoundAlreadyKnown();
     error StakingOrBurnFailed();
     error InsufficientFeesForRefund();
     error InsufficientContractBalance();
@@ -422,7 +425,7 @@ contract RPS_Tournament is ReentrancyGuard {
 
         uint64 lastRound = _getLastStoredRound();
         if (lastRound == 0) revert DrandUnavailable();
-        uint64 seedRound = lastRound + SEED_ROUND_BUFFER_ROUNDS;
+        uint64 seedRound = _computeSeedRoundForCommitWindow(lastRound, cfg.commitBlocks);
 
         if (n == 1) {
             tournaments[_tournamentId].winner = advancing[0];
@@ -460,6 +463,7 @@ contract RPS_Tournament is ReentrancyGuard {
                 revealEndBlock: revealEnd,
                 rpsRound: 0,
                 seedRound: seedRound,
+                seedCompromised: false,
                 winner: address(0)
             });
             emit MatchCreated(_tournamentId, _round, matchIndex, advancing[a], advancing[b]);
@@ -487,10 +491,10 @@ contract RPS_Tournament is ReentrancyGuard {
         if (m.winner != address(0)) revert MatchAlreadyResolved();
         if (msg.sender != m.playerA && msg.sender != m.playerB) revert NotYourMatch();
         if (block.number > m.commitEndBlock) revert CommitPhaseEnded();
-        // Ensure tiebreak randomness for this sub-round is still unknown at commit time.
-        // If the seed drand round is already stored, a player could deliberately force ties to reach a known tiebreak.
+        // Keep commits open for the full window. If the preselected seed becomes known,
+        // mark it as compromised and shift to a fresh future round at tiebreak time.
         uint64 lastRound = _getLastStoredRound();
-        if (lastRound != 0 && lastRound >= m.seedRound) revert SeedRoundAlreadyKnown();
+        if (lastRound != 0 && lastRound >= m.seedRound) m.seedCompromised = true;
         if (_commitHash == bytes32(0)) revert InvalidCommitHash();
         uint256 rr = uint256(m.rpsRound);
         if (commitHash[_tournamentId][_round][_matchIndex][rr][msg.sender] != bytes32(0)) revert CommitAlreadySet();
@@ -553,11 +557,9 @@ contract RPS_Tournament is ReentrancyGuard {
         bool hasA = committedA && choiceA != RPSChoice.None;
         bool hasB = committedB && choiceB != RPSChoice.None;
 
-        uint64 seedRound = m.seedRound;
-        (bool drandOk, bytes32 rand) = _getDrandRandomness(seedRound);
-
         address winner_;
         if (!committedA && !committedB) {
+            (bool drandOk, bytes32 rand) = _loadTiebreakRandomness(m, cfg);
             if (!drandOk) revert DrandUnavailable();
             winner_ = (uint256(rand) % 2 == 0) ? m.playerA : m.playerB;
         } else if (!committedA) {
@@ -565,6 +567,7 @@ contract RPS_Tournament is ReentrancyGuard {
         } else if (!committedB) {
             winner_ = m.playerA;
         } else if (!hasA && !hasB) {
+            (bool drandOk, bytes32 rand) = _loadTiebreakRandomness(m, cfg);
             if (!drandOk) revert DrandUnavailable();
             winner_ = (uint256(rand) % 2 == 0) ? m.playerA : m.playerB;
         } else if (!hasA) {
@@ -583,15 +586,15 @@ contract RPS_Tournament is ReentrancyGuard {
                     m.revealEndBlock = newRevealEnd;
                     
                     // (Recomputing avoids having a long-running match reach a known seedRound.)
-                    uint64 lastR = _getLastStoredRound();
-                    if (lastR == 0) revert DrandUnavailable();
-                    m.seedRound = lastR + SEED_ROUND_BUFFER_ROUNDS;
+                    m.seedRound = _computeSeedRoundForCommitWindow(cfg.commitBlocks);
+                    m.seedCompromised = false;
 
                     // progress marker to support stall detection
                     tournaments[_tournamentId].roundStartBlock = block.number;
                     emit MatchReplayed(_tournamentId, _round, _matchIndex, m.rpsRound, newCommitEnd, newRevealEnd);
                     return;
                 }
+                (bool drandOk, bytes32 rand) = _loadTiebreakRandomness(m, cfg);
                 if (!drandOk) revert DrandUnavailable();
                 winner_ = (uint256(rand) % 2 == 0) ? m.playerA : m.playerB;
             }
@@ -613,6 +616,31 @@ contract RPS_Tournament is ReentrancyGuard {
         if (a == RPSChoice.Scissors && b == RPSChoice.Paper) return playerA;
         if (a == RPSChoice.Paper && b == RPSChoice.Scissors) return playerB;
         return address(0);
+    }
+
+    function _loadTiebreakRandomness(Match storage m, TournamentConfig storage cfg) internal returns (bool exists, bytes32 randomness) {
+        uint64 seedRound = m.seedRound;
+        if (m.seedCompromised) {
+            uint64 lastRound = _getLastStoredRound();
+            if (lastRound == 0) return (false, bytes32(0));
+            // Refresh to a future drand round if the previously selected seed became known during commit.
+            seedRound = _computeSeedRoundForCommitWindow(lastRound, cfg.commitBlocks);
+            m.seedRound = seedRound;
+            m.seedCompromised = false;
+        }
+        return _getDrandRandomness(seedRound);
+    }
+
+    function _computeSeedRoundForCommitWindow(uint64 lastRound, uint256 _commitBlocks) internal pure returns (uint64) {
+        uint256 futureOffset = uint256(SEED_ROUND_BUFFER_ROUNDS)
+            + (_commitBlocks * uint256(DRAND_ROUNDS_PER_BLOCK_ESTIMATE));
+        return lastRound + uint64(futureOffset);
+    }
+
+    function _computeSeedRoundForCommitWindow(uint256 _commitBlocks) internal view returns (uint64) {
+        uint64 lastRound = _getLastStoredRound();
+        if (lastRound == 0) revert DrandUnavailable();
+        return _computeSeedRoundForCommitWindow(lastRound, _commitBlocks);
     }
 
     function _checkRoundAdvance(uint256 _tournamentId, uint256 _round) internal {
@@ -671,6 +699,7 @@ contract RPS_Tournament is ReentrancyGuard {
         if (t.id == 0) revert TournamentNotFound();
         if (t.phase != TournamentPhase.Active) revert NotActive();
         if (block.number <= t.roundStartBlock + STALL_BLOCKS) revert NotCancelableYet();
+        if (_isDrandAvailable()) revert DrandStillAvailable();
 
         address[] storage players = tournamentPlayers[_tournamentId];
         uint256 amt = tournamentConfig[_tournamentId].minEntry;
