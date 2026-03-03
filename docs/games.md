@@ -21,15 +21,15 @@ Fee: 1.5%
 ├─────────────────────────────────────────────────┤
 │                                                 │
 │  Format: Single-elimination bracket            │
-│  Entry: Min stake (e.g., 0.1 TAO)              │
+│  Entry: Min 0.5 TAO; sizes: 4, 8, or 16        │
 │  Prize: Winner takes ALL entry stakes          │
 │                                                 │
-│  Round Flow:                                    │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐  │
-│  │ COMMIT   │ →  │ REVEAL   │ →  │ RESOLVE  │  │
-│  │ (hash)   │    │ (move+   │    │ (winner  │  │
-│  │          │    │  salt)   │    │ advances)│  │
-│  └──────────┘    └──────────┘    └──────────┘  │
+│  Round Flow (drand auto-reveal):                │
+│  ┌──────────┐    ┌──────────┐                   │
+│  │ COMMIT   │ →  │ REVEAL   │  (anyone calls   │
+│  │ (TLE +   │    │ (chain   │   tryRevealMatch;│
+│  │  round)  │    │ decrypts)│   no 2nd tx)     │
+│  └──────────┘    └──────────┘                   │
 │                                                 │
 │  Example 8-player tournament:                   │
 │                                                 │
